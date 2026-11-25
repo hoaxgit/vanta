@@ -1,114 +1,127 @@
+<div align="center">
+
 # Vanta
 
-Vanta is a compatibility runtime that runs Xbox Series X|S titles natively
-on Windows x64. It is written in Rust. The title's own x86-64 code executes
-directly on your CPU; around it, Vanta implements the console's system
-APIs, translates its D3D12.X graphics calls to host Direct3D 12, and
-rewrites its RDNA2 shader programs into host DXIL — in one process, with no
-emulator and no interpreter on the hot path.
+**Xbox Series X|S titles, running natively on your Windows hardware**
 
-**This repository contains no game files or assets.** You supply your own
-copy of the title. Vanta is not affiliated with, or endorsed by, any game
-developer or publisher.
+[![Build](https://github.com/hoaxgit/vanta/actions/workflows/ci.yml/badge.svg)](https://github.com/hoaxgit/vanta/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-## Current state
+</div>
 
-The runtime is inherited from the Victory/ZTRX foundation (see
-[Provenance and license](#provenance-and-license)). The measurements below
-are that foundation's, made on Windows 11 with an NVIDIA GeForce RTX 3050
-(8 GB); they describe the code in this repository unchanged. Vanta has not
-re-measured them.
+Vanta is a Windows runtime for Xbox Series X|S software. Written in Rust, it
+takes a title's own x86-64 executable, maps it, and lets your CPU execute it
+directly — no emulation, no interpretation on the hot path. What Vanta
+replaces is the console around the code: it implements the system APIs the
+title calls, turns its D3D12.X graphics commands into host Direct3D 12, and
+recompiles its RDNA2 shader machine code into DXIL your GPU accepts. All of
+it in one process, on your hardware, at your clock speed.
+
+**No game files live in this repository.** Vanta ships none, downloads none,
+and asks for none: you point it at your own dump of a title. The project is
+not affiliated with, or endorsed by, any game developer or publisher.
+
+## Status
+
+Vanta's code grew out of the Victory/ZTRX foundation (see
+[Credits and license](#credits-and-license)). That foundation published its
+own measurements — made on Windows 11 with a GeForce RTX 3050 (8 GB) — and
+they describe this same code. Vanta reproduces them here as the inherited
+baseline, un-changed and un-re-measured:
 
 | Area | Result |
 |---|---|
 | Boot, first-boot screens, intro, credits | works |
 | Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
-| Stability | 1 h 30 min+ in one session without a crash |
-| Frame rate | 1-3 fps in the world; the first run is slower while shaders translate, and cached after that |
-| Known problems | shadowed areas render black and bright scenes overexpose (the title's ray-traced lighting does not run yet — see `docs/ray-tracing.md`); some blocky artifacts; boats sit low in the water |
+| Endurance | 1 h 30 min+ in one session without a crash |
+| Frame rate | 1-3 fps in the world; the first run is slower while shaders translate, then served from cache |
+| Known defects | shadowed areas render black and bright scenes overexpose (the title's ray-traced lighting does not run yet — see `docs/ray-tracing.md`); some blocky artifacts; boats sit low in the water |
 
-### Vanta's own results (2026-11-25)
+### Vanta's own runs (2026-11-25)
 
-Vanta has now booted an Xbox Series X|S title itself. These are Vanta's own
-measurements, read from its logs on Windows 11 with an AMD Ryzen 7 5700X and
-an NVIDIA GeForce RTX 5060 — not the foundation's:
+Vanta has since driven a title itself. The numbers below are read from
+Vanta's own logs, on Windows 11 with a Ryzen 7 5700X and a GeForce RTX
+5060:
 
-| Milestone | Status |
+| Milestone | Result |
 |---|---|
-| Executable accepted and mapped | verified — a plain PE32+ x86-64 dump loads; all 587 imports bound, zero missing |
-| Main menu / account picker | verified — the title reaches its first-run account screen |
-| Intro cutscene | partial — it starts but renders black (see below) |
-| Controller input | verified over XInput (wired/2.4 GHz pad); a Bluetooth pad is not seen by XInput |
-| Frame rate | the menu runs 30 fps; the world drops to roughly 1 fps (CPU-bound, see below) |
-| Stability | no crash across multi-minute sessions |
+| Executable loading | verified — a plain PE32+ x86-64 dump maps and binds all 587 imports with none missing |
+| Menus | verified — the title reaches its first-run account screen |
+| Intro cutscene | partial — playback starts but the picture stays black (below); it can be skipped |
+| Gameplay | verified — with the cutscene skipped, in-world play runs (the prison scene) at the world's frame rate |
+| Controller | verified over XInput (wired or 2.4 GHz pad); a Bluetooth pad is invisible to XInput |
+| Frame rate | 30 fps in the menu; roughly 1 fps once the world loads (CPU-bound, below) |
+| Stability | long sessions without a crash, including in-game play past the cutscene |
 
-Known gaps from the logs: the title asks for about 1.24 million
-shader-visible views, past the host heap's ~1 million cap (views beyond it
-read null slots); several console pipeline-creation vtable slots are not
-implemented; the depth-bounds test is left out of host pipelines; and
-cutscenes render black — the video data is read (the title's Bink2Scarlett
-decoder binds with zero missing imports) but the decoded frames do not
-reach the screen. Each is under investigation in `docs/architecture.md`.
+The same logs name the gaps: the title requests about 1.24 million
+shader-visible views against a host heap capped near one million (beyond
+it, views read null slots); a set of console pipeline-creation vtable slots
+is still unimplemented; host pipelines drop the depth-bounds test; and
+cutscenes stay black — the video data arrives (the title's Bink2Scarlett
+decoder binds with nothing missing) but the decoded frames never reach the
+screen. Each is tracked in `docs/architecture.md`.
 
-## Requirements
+## System requirements
 
-- Windows 10/11 x64 and a CPU with AVX2 (AMD-only instructions that titles
-  emit are emulated on Intel CPUs)
-- A Direct3D 12 GPU with shader model 6.6 and mesh shaders; tested hardware
-  is NVIDIA RTX 20 series or newer
-- Rust, per `rust-toolchain.toml`
-- Several GB of free Windows commit memory — raise the paging file if
-  `crashes.log` reports error 1455
+- Windows 10 or 11, x64, and a CPU with AVX2 (instructions only AMD CPUs
+  execute are emulated on Intel)
+- A Direct3D 12 GPU with shader model 6.6 and mesh shaders — NVIDIA RTX 20
+  series and newer is what has been tested
+- Rust, as pinned in `rust-toolchain.toml`
+- A few gigabytes of spare Windows commit memory; if `crashes.log` reports
+  error 1455, enlarge the paging file
 
-## Build
+## Building
+
+One command builds the release binary to `target\release\vanta.exe`:
 
 ```powershell
 cargo build --release -p vanta
 ```
 
-## Launch
+## Running a title
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
 
-`scripts\play.ps1` keeps the shader cache and saved data in the folders you
-choose (`-Cache`, `-Data`) and writes the run log to `%TEMP%\vanta.log`. It
-presses no keys for you. Controller: XInput pads (a DualShock or DualSense
-through DS4Windows works). With no pad connected, the keyboard acts as one
-while the game window has focus.
+The script keeps the shader cache and saved data wherever you point it
+(`-Cache`, `-Data`) and writes the run log to `%TEMP%\vanta.log`. It never
+presses keys for you. Pads reach the game through XInput — a DualShock or
+DualSense behind DS4Windows works too — and while no pad is connected and
+the game window has focus, the keyboard stands in for one.
 
-On first play every pipeline's shaders are translated at first use and
-cached on disk; later runs load them instead of re-translating. The cache
-is keyed by the Vanta build and every translation-affecting setting, so a
-rebuild or a changed switch re-translates rather than serving stale
-results.
+The first run of a title translates every pipeline's shaders the moment
+they are first used and stores them on disk; later runs load them instead.
+The cache key covers the Vanta build and every setting that can change a
+translation, so a rebuilt binary or a flipped switch re-translates rather
+than serving a stale result.
 
-## Configuration
+## Paths and settings
 
 Copy `vanta.example.toml` to `vanta.toml` (git-ignored) and point it at
-your files. Environment variables take precedence over the file:
+your files. Environment variables win over the file:
 
 | Variable | Meaning |
 |---|---|
-| `VANTA_GAME_DIR` | your own dump of the title |
-| `VANTA_CACHE_DIR` | derived data (default `%LOCALAPPDATA%\vanta\cache`) |
-| `VANTA_DATA_DIR` | what titles save — persistent local storage (default `%LOCALAPPDATA%\vanta\data`) |
-| `VANTA_TEST_TITLES` | other Xbox Series titles used to test platform-level code (`;`-separated) |
-| `VANTA_CONFIG` | selects a different config file |
+| `VANTA_GAME_DIR` | where your own dump of the title lives |
+| `VANTA_CACHE_DIR` | derived data such as translated shaders (default `%LOCALAPPDATA%\vanta\cache`) |
+| `VANTA_DATA_DIR` | where titles keep saves — persistent local storage (default `%LOCALAPPDATA%\vanta\data`) |
+| `VANTA_TEST_TITLES` | further Xbox Series titles for exercising platform-level code (`;`-separated) |
+| `VANTA_CONFIG` | use a different config file |
 
-Every path must be outside the repository; the tools refuse otherwise
-(`docs/asset-policy.md`).
+Every path must sit outside this repository; the tooling refuses anything
+else (`docs/asset-policy.md`).
 
-## Faster settings (optional, off by default)
+## Tuning performance (optional, off by default)
 
-`VANTA_RELAY=2`, or `VANTA_LATE_WAIT=3 VANTA_WIDE_BACK=1`, cut frame time
-on the tested machine. Set them in PowerShell before the launch script.
+`VANTA_RELAY=2`, alone or with `VANTA_LATE_WAIT=3 VANTA_WIDE_BACK=1`, cut
+frame time on the tested machine. Set them in PowerShell before launching.
 
-The world's ~1 fps is CPU-bound, not GPU-bound (the GPU sits ~2-32% busy
-while the CPU snapshots and compares title buffers). On the RTX 5060, moving
-the 1-16 MB title buffers to the GPU cut the per-frame "preparing" time
-roughly threefold:
+The world's ~1 fps is a CPU limit, not a GPU one — the GPU sits at ~2-32%
+utilization while the CPU snapshots and compares title buffers. On the RTX
+5060, moving the 1-16 MB buffers onto the GPU cut the per-frame
+"preparing" time about threefold:
 
 ```powershell
 $env:VANTA_CARD_BUFFERS_MIN_MB = "1"   # default 16: only >=16 MB buffers use the card
@@ -117,32 +130,32 @@ $env:VANTA_JOIN_COPIES        = "1"
 $env:VANTA_CARD_REHASH_RUNS   = "1"
 ```
 
-These are measured on one machine; they do not change the CPU-bound nature
-of the runtime, only where the buffer bookkeeping happens.
+These come from one machine's measurements; they relocate buffer
+bookkeeping, they do not remove the CPU bottleneck.
 
-## Diagnostics and tools
+## Tools and diagnostics
 
-The `vanta` command front end:
+Everything is driven through one command:
 
 | Command | Purpose |
 |---|---|
-| `vanta census [paths]` | which imports of a title our runtime covers; `--missing` lists the rest, most used first |
-| `vanta translate [paths]` | run every shader container found through the translator; lists what cannot be handled yet |
-| `vanta inspect <file>` | one PE image: headers, sections, imports, TLS, build id |
-| `vanta shader-info [paths]` | find shader containers (also inside engine archives, if uncompressed) and report their layout |
+| `vanta census [paths]` | how much of a title's import surface this runtime covers; `--missing` lists the rest, most-referenced first |
+| `vanta translate [paths]` | push every shader container found through the translator; names what it cannot handle yet |
+| `vanta inspect <file>` | one PE image — headers, sections, imports, TLS, build identity |
+| `vanta shader-info [paths]` | locate shader containers (including inside engine archives, when uncompressed) and describe their layout |
 | `vanta lib-exports <lib>` | the `dll!export` pairs an import library describes |
-| `vanta run <exe> --execute` | prepare, map, bind and start a title (as `play.ps1` does) |
+| `vanta run <exe> --execute` | prepare, map, bind and start a title — what `play.ps1` runs |
 
-`vanta run` without `--execute` maps and binds without starting.
-`--unimplemented trap` (the default) makes an unimplemented import break
-into the debugger and abort when called; `zero` logs once and returns 0.
-`--console series-x` or `series-s` selects the model the title sees.
+`vanta run` without `--execute` maps and binds, then stops.
+`--unimplemented trap` (the default) makes a call to an unimplemented
+import break into the debugger and abort; `zero` logs once and returns 0.
+`--console series-x` or `series-s` picks the console model the title sees.
 
-Structured diagnostics go to stderr with an uptime timestamp, severity and
-source line per entry. `VANTA_LOG` (or `RUST_LOG`) sets the level, e.g.
-`$env:VANTA_LOG = "vanta_gpu=trace"`; the default is `info`.
+Diagnostics reach stderr structured: an uptime timestamp, a severity and
+the source line on every entry. `VANTA_LOG` (or `RUST_LOG`) chooses the
+level — `$env:VANTA_LOG = "vanta_gpu=trace"` — and `info` is the default.
 
-For deeper diagnosis, build the diagnostics profile and use its switches:
+For deeper work, build the diagnostics profile and use its switches:
 
 ```powershell
 cargo build --profile diag -p vanta --features diagnostics
@@ -150,26 +163,28 @@ cargo build --profile diag -p vanta --features diagnostics
 
 | Switch | Effect |
 |---|---|
-| `VANTA_CAPTURE=<dir>` + `VANTA_CAPTURE_FRAMES=<list>` | save those frames as PNG |
-| `VANTA_KEYS=30:Enter,35:X` | press keys at those seconds |
-| `VANTA_D3D12_DRED=1` | on a GPU failure, report the commands in flight |
-| `VANTA_PIPELINE_WAIT_MS=24` | shorter per-frame wait for pipelines still being built |
+| `VANTA_CAPTURE=<dir>` + `VANTA_CAPTURE_FRAMES=<list>` | dump those frames as PNG |
+| `VANTA_KEYS=30:Enter,35:X` | synthesize key presses at chosen seconds |
+| `VANTA_D3D12_DRED=1` | after a GPU failure, report the commands in flight |
+| `VANTA_PIPELINE_WAIT_MS=24` | shorten the per-frame wait for pipelines still building |
 
-## Documentation
+## Further reading
 
-- `docs/architecture.md` — how the runtime works, and what is inherited
-  versus Vanta-specific
-- `docs/ray-tracing.md` — the title's ray-traced lighting, translated and
+- `docs/architecture.md` — how the runtime works, and which parts are
+  inherited versus Vanta's own
+- `docs/ray-tracing.md` — the title's ray-traced lighting: translated,
   emulated shader-side, and what still blocks it
-- `docs/asset-policy.md` — the no-game-data rule and its enforcement
-- `CONTRIBUTING.md` — conventions for changes to this project
+- `docs/asset-policy.md` — the no-game-data rule and how it is enforced
+- `CONTRIBUTING.md` — how changes to this project are made
 
-## Provenance and license
+## Credits and license
 
-GPL-3.0-or-later; see `LICENSE`. Vanta is built on the Victory/ZTRX
-foundation — VIctory by Marvisak, victory-fork by fxceless & ztrx by Zettrox — and the
-runtime's substance is theirs; the crate layout, environment switches and
-documentation carry Vanta's own naming. Vanta's own engineering work so far
-is listed in `docs/architecture.md`, and starts with making the shader
-cache honest about every input that affects a translation. Upstream
-copyright notices and attribution are preserved throughout.
+Vanta is GPL-3.0-or-later; the full text is in `LICENSE`. The runtime's
+substance descends from the Victory/ZTRX foundation — VIctory by Marvisak,
+victory-fork by fxceless, ztrx by Zettrox — and this project would not
+exist without them. What Vanta adds on top — the naming, the crate layout,
+the environment switches, the documentation, and its own engineering work,
+recorded in `docs/architecture.md` and starting with a shader cache made
+honest about every input that affects a translation — is deliberately
+marked as its own. Upstream copyright notices and attribution are
+preserved throughout.
