@@ -125,7 +125,7 @@ cargo build --profile diag -p vanta --features diagnostics
 ## Provenance and license
 
 GPL-3.0-or-later; see `LICENSE`. Vanta is built on the Victory/ZTRX
-foundation — VIctory by Marvisak and victory-fork by fxceless — and the
+foundation — VIctory by Marvisak, victory-fork by fxceless & ztrx by Zettrox — and the
 runtime's substance is theirs; the crate layout, environment switches and
 documentation carry Vanta's own naming. Vanta's own engineering work so far
 is listed in `docs/architecture.md`, and starts with making the shader
