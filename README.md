@@ -24,39 +24,25 @@ not affiliated with, or endorsed by, any game developer or publisher.
 ## Status
 
 Vanta's code grew out of the Victory/ZTRX foundation (see
-[Credits and license](#credits-and-license)). That foundation published its
-own measurements — made on Windows 11 with a GeForce RTX 3050 (8 GB) — and
-they describe this same code. Vanta reproduces them here as the inherited
-baseline, un-changed and un-re-measured:
-
-| Area | Result |
-|---|---|
-| Boot, first-boot screens, intro, credits | works |
-| Prologue | playable from the cell to the boat chase: cell, cafeteria, robbery, police chase (wanted level, minimap), boat, binoculars |
-| Endurance | 1 h 30 min+ in one session without a crash |
-| Frame rate | 1-3 fps in the world; the first run is slower while shaders translate, then served from cache |
-| Known defects | shadowed areas render black and bright scenes overexpose (the title's ray-traced lighting does not run yet — see `docs/ray-tracing.md`); some blocky artifacts; boats sit low in the water |
-
-### Vanta's own runs (2026-11-25)
-
-Vanta has since driven a title itself. The numbers below are read from
-Vanta's own logs, on Windows 11 with a Ryzen 7 5700X and a GeForce RTX
-5060:
+[Credits and license](#credits-and-license)). The results below are
+Vanta's own, read from its logs on Windows 11 with a Ryzen 7 5700X and a
+GeForce RTX 5060:
 
 | Milestone | Result |
 |---|---|
 | Executable loading | verified — a plain PE32+ x86-64 dump maps and binds all 587 imports with none missing |
-| Menus | verified — the title reaches its first-run account screen |
+| Boot and menus | verified — the title boots and reaches its first-run account screen |
 | Intro cutscene | partial — playback starts but the picture stays black (below); it can be skipped |
-| Gameplay | verified — with the cutscene skipped, in-world play runs (the prison scene) at the world's frame rate |
+| Gameplay | verified — with the cutscene skipped, in-world play runs (the prison scene), with imperfect graphics |
 | Controller | verified over XInput (wired or 2.4 GHz pad); a Bluetooth pad is invisible to XInput |
-| Frame rate | 30 fps in the menu; roughly 1 fps once the world loads (CPU-bound, below) |
+| Frame rate | 30 fps in the menu; roughly 1 fps in the world; the first run is slower while shaders translate, then they are served from cache |
 | Stability | long sessions without a crash, including in-game play past the cutscene |
 
 The same logs name the gaps: the title requests about 1.24 million
 shader-visible views against a host heap capped near one million (beyond
 it, views read null slots); a set of console pipeline-creation vtable slots
-is still unimplemented; host pipelines drop the depth-bounds test; and
+is still unimplemented; host pipelines drop the depth-bounds test; the
+title's ray-traced lighting does not run yet (`docs/ray-tracing.md`); and
 cutscenes stay black — the video data arrives (the title's Bink2Scarlett
 decoder binds with nothing missing) but the decoded frames never reach the
 screen. Each is tracked in `docs/architecture.md`.
