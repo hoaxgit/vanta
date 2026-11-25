@@ -191,6 +191,24 @@ fn kind(index: usize) -> u32 {
     }
 }
 
+/// What a device index is, for logs and diagnostics. Slots 0-3 are the host
+/// XInput pads, 4 is the keyboard's stand-in gamepad (present only while no
+/// real pad is connected), 5 is the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Role {
+    Gamepad,
+    StandIn,
+    Keyboard,
+}
+
+fn role(index: usize) -> Role {
+    match index {
+        KEYBOARD => Role::Keyboard,
+        FALLBACK => Role::StandIn,
+        _ => Role::Gamepad,
+    }
+}
+
 impl Device {
     fn new(index: usize) -> Device {
         let mut id = [0; 32];
@@ -494,7 +512,12 @@ impl State {
             }));
         }
         if was != slot.connected {
-            tracing::info!(device = index, connected = !was, "input device");
+            tracing::info!(
+                device = index,
+                role = ?role(index),
+                connected = !was,
+                "input device"
+            );
             let (current, previous) = if was {
                 (0, STATUS_CONNECTED)
             } else {
@@ -543,6 +566,14 @@ pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
     }
     // SAFETY: checked non-null; the title passes room for a pointer.
     unsafe { out.write(&HUB.object) };
+    let state = hub(&HUB.object).state();
+    let gamepads = (0..PADS).filter(|&i| state.slots[i].connected).count();
+    tracing::info!(
+        gamepads,
+        stand_in = state.slots[FALLBACK].connected,
+        keyboard = state.slots[KEYBOARD].connected,
+        "input devices (the stand-in pad is present only while no real gamepad is connected)"
+    );
     S_OK
 }
 
@@ -1424,6 +1455,14 @@ mod tests {
             Some(Provenance::Hle)
         );
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
+    }
+
+    #[test]
+    fn device_roles_are_gamepad_stand_in_and_keyboard() {
+        assert_eq!(role(0), Role::Gamepad);
+        assert_eq!(role(PADS - 1), Role::Gamepad);
+        assert_eq!(role(FALLBACK), Role::StandIn);
+        assert_eq!(role(KEYBOARD), Role::Keyboard);
     }
 
     #[test]
