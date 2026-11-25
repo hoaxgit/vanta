@@ -104,10 +104,28 @@ else (`docs/asset-policy.md`).
 `VANTA_RELAY=2`, alone or with `VANTA_LATE_WAIT=3 VANTA_WIDE_BACK=1`, cut
 frame time on the tested machine. Set them in PowerShell before launching.
 
-The world's ~1 fps is a CPU limit, not a GPU one — the GPU sits at ~2-32%
-utilization while the CPU snapshots and compares title buffers. On the RTX
-5060, moving the 1-16 MB buffers onto the GPU cut the per-frame
-"preparing" time about threefold:
+Most sampled world frames were 0.4–1.2 fps in the latest scripted profile,
+with substantial variation. The
+frame cost is mixed: host-side buffer preparation, copies and synchronization
+are large, while GPU work also varies substantially. One first-use view-heap
+pass took 3.9 seconds; sampled heap-buffer passes then took 130–770 ms per
+frame, buffer copies 80–250 ms, copyback up to 850 ms, and GPU work 5–915 ms.
+These are observed ranges, not a per-frame sum.
+
+Texture refresh now avoids waiting on the title-memory remap lock by default.
+If the lock is unavailable, Vanta reads the whole texture through the kernel
+or leaves the previous image for a later refresh; it never uploads a partial
+read. Set `VANTA_TEXTURE_NO_WAIT=0` to restore blocking behavior. In the
+blocking capture, one frame took 3,072 ms, including 1,848 ms waiting for
+that lock. In the new-default capture, every sampled world frame reported
+0 ms of remap-lock wait. The captures were not identical frames, and the
+world remained slow, so this verifies removal of that wait—not an overall
+FPS gain.
+
+In one combined tuning run on the RTX 5060, the per-frame "preparing" metric
+fell from 336 ms to 109 ms while moving 1–16 MB buffers onto the GPU and
+enabling the copy-join and card-rehash options below. This is one run, not an
+isolated attribution or a general FPS result:
 
 ```powershell
 $env:VANTA_CARD_BUFFERS_MIN_MB = "1"   # default 16: only >=16 MB buffers use the card

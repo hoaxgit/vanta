@@ -280,8 +280,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VANTA_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (`VANTA_TEXTURE_NO_WAIT=0` restores the
+/// blocking behavior; nonblocking refresh is the default).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -293,7 +293,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// of it (1,345 of 1,381 ms; 3,630 of 3,708; the write-watch askings 3-12
 /// ms, the texture's own lock 0).
 ///
-/// With the switch the refresh asks for the lock without waiting. If the
+/// In nonblocking mode the refresh asks for the lock without waiting. If the
 /// runtime has it, the texture is read through the kernel instead, which
 /// needs no lock: it fails if a page is not there, and then the texture is
 /// left as it is and read at its next refresh, a frame later. A read
@@ -301,9 +301,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+fn no_wait_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value == "1")
+}
+
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VANTA_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| no_wait_setting(std::env::var_os("VANTA_TEXTURE_NO_WAIT").as_deref()))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -1058,6 +1062,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn remap_wait_is_nonblocking_by_default_and_can_be_restored() {
+        assert!(super::no_wait_setting(None));
+        assert!(super::no_wait_setting(Some(std::ffi::OsStr::new("1"))));
+        assert!(!super::no_wait_setting(Some(std::ffi::OsStr::new("0"))));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
