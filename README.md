@@ -32,7 +32,7 @@ GeForce RTX 5060:
 |---|---|
 | Executable loading | verified — a plain PE32+ x86-64 dump maps and binds all 587 imports with none missing |
 | Boot and menus | verified — the title boots and reaches its first-run account screen |
-| Intro cutscene | partial — playback starts but the picture stays black (below); it can be skipped |
+| Intro cutscene | renders — the picture plays (cafe, prison) at the world's 1-2 fps; early runs showed it black until its pipelines were translated |
 | Gameplay | verified — with the cutscene skipped, in-world play runs (the prison scene), with imperfect graphics |
 | Controller | verified over XInput (wired or 2.4 GHz pad); a Bluetooth pad is invisible to XInput |
 | Frame rate | 30 fps in the menu; roughly 1 fps in the world; the first run is slower while shaders translate, then they are served from cache |
@@ -42,10 +42,10 @@ The same logs name the gaps: the title requests about 1.24 million
 shader-visible views against a host heap capped near one million (beyond
 it, views read null slots); a set of console pipeline-creation vtable slots
 is still unimplemented; host pipelines drop the depth-bounds test; the
-title's ray-traced lighting does not run yet (`docs/ray-tracing.md`); and
-cutscenes stay black — the video data arrives (the title's Bink2Scarlett
-decoder binds with nothing missing) but the decoded frames never reach the
-screen. Each is tracked in `docs/architecture.md`.
+title's ray-traced lighting does not run yet (`docs/ray-tracing.md`). The
+cutscenes played black until their pipelines had been translated on demand;
+with the cache warm, the intro renders. Each is tracked in
+`docs/architecture.md`.
 
 ## System requirements
 
