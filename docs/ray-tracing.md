@@ -1,4 +1,4 @@
-# Ray tracing in this fork: what the title does and what has been built
+# Ray tracing in Vanta: what the title does and what is built
 
 Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
 machinery translates and is unit-tested; it has not yet run end to end in the
@@ -30,10 +30,10 @@ The title does not use a ray-tracing API:
 So mapping this onto the host's own ray tracing (DXR) is not practical: the
 layer would have to know the geometry behind structures the title never
 describes to it, and the traversal loops live in 64 of the title's own
-programs. This fork runs the title's builder and traversal as translated
+programs. Vanta runs the title's builder and traversal as translated
 shaders and emulates the one instruction.
 
-## What this fork adds
+## What the runtime does about it
 
 1. **The builder programs translate** (49 of 52; all that the title creates in
    the scenes tested). They pass buffer addresses in a spilled parameter table

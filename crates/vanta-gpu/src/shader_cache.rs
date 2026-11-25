@@ -1,7 +1,8 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
 //! cache folder, keyed by the container's content and by the Vanta build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! that translated it (the BLAKE3 of our executable and of the
+//! translator's settings), so a rebuilt translator, or a run with other
+//! settings, never serves an old translation. Entries go through
 //! `vanta-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -38,8 +39,9 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (`vanta_shader::emit::
+/// translation_settings` lists them: the switches the translator reads
+/// and the host device's wave size and view-heap limit).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -52,31 +54,7 @@ fn build() -> &'static [u8; 32] {
             );
         }
         match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                // Which group barriers wait is part of the translation too.
-                bytes.push(vanta_shader::emit::group_sync());
-                // So are the switches that pick the form of a wave64 program:
-                // without them here a run with `VANTA_WAVE_WIDE=0` was
-                // served the translations an earlier run of the same
-                // executable had cached with the switch unset.
-                for name in [
-                    "VANTA_WAVE_WIDE",
-                    "VANTA_WAVE_DEEP_SKIPS",
-                    "VANTA_WAVE_OWN_BITS",
-                    "VANTA_F16_NEAREST",
-                ] {
-                    bytes.extend_from_slice(name.as_bytes());
-                    bytes.push(b'=');
-                    if let Some(value) = std::env::var_os(name) {
-                        bytes.extend_from_slice(value.as_encoded_bytes());
-                    }
-                    bytes.push(0);
-                }
-                // And which clean-up passes ran over the translated code.
-                bytes.extend_from_slice(&vanta_shader::emit::shader_opt().to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
+            Ok(bytes) => fingerprint(&bytes, &vanta_shader::emit::translation_settings()),
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
@@ -87,6 +65,13 @@ fn build() -> &'static [u8; 32] {
             }
         }
     })
+}
+
+/// The build's key besides the container's own bytes: its executable and
+/// the translator's settings. Pure, for testing ([`build`] reads them
+/// from the process).
+fn fingerprint(exe: &[u8], settings: &[u8]) -> [u8; 32] {
+    *blake3::hash(&[exe, settings].concat()).as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -411,5 +396,39 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn the_build_key_takes_the_translator_settings() {
+        // The settings must reach the key: without them a run with, say,
+        // `VANTA_WAVE_LOCAL=0` was served the translations an earlier run
+        // of the same executable had cached with the switch unset.
+        // `vanta-shader`'s tests walk its own list; this one pins that
+        // the list covers the switches a run can set and the host facts,
+        // and that the key changes with the settings.
+        let exe = b"an executable".as_slice();
+        let settings = vanta_shader::emit::translation_settings();
+        for name in [
+            "VANTA_WAVE_WIDE",
+            "VANTA_WAVE_DEEP_SKIPS",
+            "VANTA_WAVE_OWN_BITS",
+            "VANTA_F16_NEAREST",
+            "VANTA_WAVE_LOCAL",
+            "VANTA_STRICT_JOINS",
+            "VANTA_MESH_OUTPUT_STRICT",
+            "host_wave",
+            "view_limit",
+        ] {
+            let entry = [name.as_bytes(), b"="].concat();
+            assert!(
+                settings.windows(entry.len()).any(|w| w == entry),
+                "{name} is not in the settings"
+            );
+        }
+        assert_eq!(fingerprint(exe, &settings), fingerprint(exe, &settings));
+        assert_ne!(fingerprint(exe, &settings), fingerprint(exe, b""));
+        let mut other = settings.clone();
+        other[0] ^= 1;
+        assert_ne!(fingerprint(exe, &settings), fingerprint(exe, &other));
     }
 }

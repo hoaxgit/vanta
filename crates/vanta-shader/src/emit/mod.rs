@@ -110,12 +110,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -213,6 +213,90 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         Some(n) if n > 0 => n,
         _ => lower::LOOP_LIMIT,
     }
+}
+
+/// Every input besides a container's own bytes that can change what
+/// `translate` returns for it: the environment switches of
+/// [`SETTINGS_SWITCHES`] and the host facts of [`settings_bytes`].
+/// `vanta-gpu` mixes this into its shader cache's build fingerprint
+/// (`vanta-gpu::shader_cache`), so a run with other settings is never
+/// served another run's cached translations. A switch added to the
+/// translator must be added to [`SETTINGS_SWITCHES`] and a host fact to
+/// [`settings_bytes`]; the tests walk both lists.
+pub fn translation_settings() -> Vec<u8> {
+    let switches: Vec<(&str, Option<std::ffi::OsString>)> = SETTINGS_SWITCHES
+        .iter()
+        .map(|&name| (name, std::env::var_os(name)))
+        .collect();
+    settings_bytes(
+        &switches,
+        host_max_wave(),
+        view_heap_limit(),
+        loop_limit(),
+        group_sync(),
+        shader_opt(),
+    )
+}
+
+/// The environment switches the translator reads mid-translation, in a
+/// fixed order. The tooling switches (`VANTA_WARP`, `VANTA_DXIL`,
+/// `VANTA_SHADER_CENSUS`, `VANTA_WAVE_WHY`) only report, and are not
+/// listed. What each one changes:
+/// - `VANTA_WAVE_WIDE`, `VANTA_WAVE_DEEP_SKIPS`, `VANTA_WAVE_LOCAL`:
+///   which fallback forms a wave64 program on a 32-lane host is tried
+///   in (`translate`).
+/// - `VANTA_WAVE_OWN_BITS`, `VANTA_F16_NEAREST`: what a lowered
+///   operation does (`lower`).
+/// - `VANTA_STRICT_JOINS`: a missing phi join refuses the program
+///   instead of zero-filling it.
+/// - `VANTA_MESH_OUTPUT_STRICT`: a mesh shader's over-capacity outputs
+///   refuse it instead of emitting them.
+pub(crate) const SETTINGS_SWITCHES: [&str; 7] = [
+    "VANTA_WAVE_WIDE",
+    "VANTA_WAVE_DEEP_SKIPS",
+    "VANTA_WAVE_OWN_BITS",
+    "VANTA_F16_NEAREST",
+    "VANTA_WAVE_LOCAL",
+    "VANTA_STRICT_JOINS",
+    "VANTA_MESH_OUTPUT_STRICT",
+];
+
+/// [`translation_settings`]'s bytes, of the inputs it gathers. Pure, for
+/// testing. An entry is the name, `=`, the value's bytes and a NUL, so an
+/// unset switch is an empty value, not a missing entry. The host facts
+/// come last, as words: the host's wave size ([`set_host_max_wave`]), the
+/// view-heap limit ([`set_view_heap_limit`]), the loop limit, the group
+/// barrier mode and the clean-up passes.
+fn settings_bytes(
+    switches: &[(&str, Option<std::ffi::OsString>)],
+    host_wave: u32,
+    view_limit: u32,
+    loop_limit: u32,
+    group_sync: u8,
+    shader_opt: u32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, value) in switches {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = value {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    for (name, words) in [
+        ("host_wave", host_wave.to_le_bytes()),
+        ("view_limit", view_limit.to_le_bytes()),
+        ("loop_limit", loop_limit.to_le_bytes()),
+        ("group_sync", u32::from(group_sync).to_le_bytes()),
+        ("shader_opt", shader_opt.to_le_bytes()),
+    ] {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(&words);
+        out.push(0);
+    }
+    out
 }
 
 /// A translated shader and what the host binds for it.
@@ -779,6 +863,69 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn translation_settings_names_every_switch_and_host_fact() {
+        // A run must be able to tell its settings from another run's:
+        // every switch and host fact is listed, unset ones as empty
+        // values rather than missing entries.
+        let bytes = translation_settings();
+        let listed = |name: &str| {
+            let entry = [name.as_bytes(), b"="].concat();
+            bytes.windows(entry.len()).any(|w| w == entry)
+        };
+        for name in SETTINGS_SWITCHES {
+            assert!(listed(name), "{name} is not in the settings");
+        }
+        for name in [
+            "host_wave",
+            "view_limit",
+            "loop_limit",
+            "group_sync",
+            "shader_opt",
+        ] {
+            assert!(listed(name), "{name} is not in the settings");
+        }
+    }
+
+    #[test]
+    fn a_change_in_any_setting_changes_the_settings_bytes() {
+        let switches = || SETTINGS_SWITCHES.map(|name| (name, None));
+        let base = settings_bytes(&switches(), 32, 0, LOOP_LIMIT, 2, bitcode::opt::ALL);
+        assert_eq!(
+            base,
+            settings_bytes(&switches(), 32, 0, LOOP_LIMIT, 2, bitcode::opt::ALL)
+        );
+        for at in 0..SETTINGS_SWITCHES.len() {
+            let mut set = switches();
+            set[at].1 = Some(std::ffi::OsString::from("1"));
+            assert_ne!(
+                base,
+                settings_bytes(&set, 32, 0, LOOP_LIMIT, 2, bitcode::opt::ALL),
+                "{} changed nothing",
+                SETTINGS_SWITCHES[at]
+            );
+        }
+        for (host_wave, view_limit, loop_limit, group_sync, shader_opt) in [
+            (64, 0, LOOP_LIMIT, 2, bitcode::opt::ALL),
+            (32, 1, LOOP_LIMIT, 2, bitcode::opt::ALL),
+            (32, 0, 4096, 2, bitcode::opt::ALL),
+            (32, 0, LOOP_LIMIT, 0, bitcode::opt::ALL),
+            (32, 0, LOOP_LIMIT, 2, 0),
+        ] {
+            assert_ne!(
+                base,
+                settings_bytes(
+                    &switches(),
+                    host_wave,
+                    view_limit,
+                    loop_limit,
+                    group_sync,
+                    shader_opt
+                )
+            );
         }
     }
     use super::container::SigElement;

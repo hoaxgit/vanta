@@ -77,11 +77,10 @@
 Thumbs.db
 .DS_Store
 
-# Local toolchain / migration source
+# Local toolchain
 /.rustup/
 /.cargohome/
 /__pycache__/
-/zettrox ztrx/
 
 # Cargo caches downloaded by the local toolchain (tracked .cargo/config.toml is kept)
 /.cargo/registry/
