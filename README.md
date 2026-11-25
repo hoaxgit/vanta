@@ -27,6 +27,29 @@ re-measured them.
 | Frame rate | 1-3 fps in the world; the first run is slower while shaders translate, and cached after that |
 | Known problems | shadowed areas render black and bright scenes overexpose (the title's ray-traced lighting does not run yet — see `docs/ray-tracing.md`); some blocky artifacts; boats sit low in the water |
 
+### Vanta's own results (2026-11-25)
+
+Vanta has now booted an Xbox Series X|S title itself. These are Vanta's own
+measurements, read from its logs on Windows 11 with an AMD Ryzen 7 5700X and
+an NVIDIA GeForce RTX 5060 — not the foundation's:
+
+| Milestone | Status |
+|---|---|
+| Executable accepted and mapped | verified — a plain PE32+ x86-64 dump loads; all 587 imports bound, zero missing |
+| Main menu / account picker | verified — the title reaches its first-run account screen |
+| Intro cutscene | partial — it starts but renders black (see below) |
+| Controller input | verified over XInput (wired/2.4 GHz pad); a Bluetooth pad is not seen by XInput |
+| Frame rate | the menu runs 30 fps; the world drops to roughly 1 fps (CPU-bound, see below) |
+| Stability | no crash across multi-minute sessions |
+
+Known gaps from the logs: the title asks for about 1.24 million
+shader-visible views, past the host heap's ~1 million cap (views beyond it
+read null slots); several console pipeline-creation vtable slots are not
+implemented; the depth-bounds test is left out of host pipelines; and
+cutscenes render black — the video data is read (the title's Bink2Scarlett
+decoder binds with zero missing imports) but the decoded frames do not
+reach the screen. Each is under investigation in `docs/architecture.md`.
+
 ## Requirements
 
 - Windows 10/11 x64 and a CPU with AVX2 (AMD-only instructions that titles
@@ -82,6 +105,21 @@ Every path must be outside the repository; the tools refuse otherwise
 `VANTA_RELAY=2`, or `VANTA_LATE_WAIT=3 VANTA_WIDE_BACK=1`, cut frame time
 on the tested machine. Set them in PowerShell before the launch script.
 
+The world's ~1 fps is CPU-bound, not GPU-bound (the GPU sits ~2-32% busy
+while the CPU snapshots and compares title buffers). On the RTX 5060, moving
+the 1-16 MB title buffers to the GPU cut the per-frame "preparing" time
+roughly threefold:
+
+```powershell
+$env:VANTA_CARD_BUFFERS_MIN_MB = "1"   # default 16: only >=16 MB buffers use the card
+$env:VANTA_CARD_BUFFERS_MB    = "2048" # default 512: raise if the card budget fills
+$env:VANTA_JOIN_COPIES        = "1"
+$env:VANTA_CARD_REHASH_RUNS   = "1"
+```
+
+These are measured on one machine; they do not change the CPU-bound nature
+of the runtime, only where the buffer bookkeeping happens.
+
 ## Diagnostics and tools
 
 The `vanta` command front end:
@@ -99,6 +137,10 @@ The `vanta` command front end:
 `--unimplemented trap` (the default) makes an unimplemented import break
 into the debugger and abort when called; `zero` logs once and returns 0.
 `--console series-x` or `series-s` selects the model the title sees.
+
+Structured diagnostics go to stderr with an uptime timestamp, severity and
+source line per entry. `VANTA_LOG` (or `RUST_LOG`) sets the level, e.g.
+`$env:VANTA_LOG = "vanta_gpu=trace"`; the default is `info`.
 
 For deeper diagnosis, build the diagnostics profile and use its switches:
 
