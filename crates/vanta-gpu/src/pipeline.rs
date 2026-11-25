@@ -122,7 +122,13 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: vanta_shader::emit::HostShader,
+    /// The console resources its code reads: the diagnostics build's
+    /// first-draw trace reads them.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) used: Vec<vanta_shader::UsedResource>,
+    /// The tables pass of `draw::State::bind`, planned once here: what
+    /// it re-derived on every draw before.
+    pub(crate) plan: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -194,7 +200,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let plan = crate::draw::table_plan(&used, &host.root_indexed_views, &host.user_data);
+    Ok(Translated {
+        host,
+        used,
+        plan,
+        stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

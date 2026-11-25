@@ -146,6 +146,120 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VANTA_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// A table copy held in dynamic slots: the record words it was made from
+/// (three a slot), and its first dynamic slot. The words are compared
+/// exactly on every draw, so a copy whose table the title rewrote
+/// between draws is made anew.
+#[derive(Clone)]
+struct FreshCopy {
+    words: Vec<u32>,
+    first: u32,
+}
+
+/// A per-shader binding plan: what [`State::tables`] re-derived on every
+/// draw before. Pure in the shader's used resources, its indexed views
+/// and its user data; made once with its translation.
+pub(crate) struct TablePlan {
+    /// Every used table resource, in `used` order: the pass that binds
+    /// the title's own slots walks them in this order.
+    flat: Vec<UsedResource>,
+    /// The distinct table slots, sorted; CBV ones are made afresh always.
+    slots: Vec<SlotPlan>,
+    /// The slots whose root views begin early on the host copy
+    /// (`USER_VIEW_BIAS`): the root-view pass of [`State::bind`] reads
+    /// these.
+    bias: Vec<u8>,
+}
+
+/// One table slot of a [`TablePlan`].
+pub(crate) struct SlotPlan {
+    slot: u8,
+    /// The table's own entries, in `used` order.
+    entries: Vec<UsedResource>,
+    /// `max(entry.table_offset_dwords / 8)`: the extent in slots.
+    extent: u32,
+    /// The table holds a constant buffer: made afresh always.
+    cbv: bool,
+    /// The indexed views that read root constants per draw: (constant
+    /// slot, constant dword, byte offset, shift).
+    indexed: Vec<(u8, u32, u32, u8)>,
+}
+
+/// The binding plan of a translated shader.
+pub(crate) fn table_plan(
+    used: &[UsedResource],
+    indexed: &[RootIndexedView],
+    user_data: &[vanta_shader::emit::UserData],
+) -> TablePlan {
+    let mut flat = Vec::new();
+    let mut slots: Vec<SlotPlan> = Vec::new();
+    for u in used.iter().filter(|u| u.root == RootType::Table) {
+        flat.push(*u);
+        let at = slots
+            .binary_search_by_key(&u.slot, |s| s.slot)
+            .unwrap_or_else(|at| {
+                slots.insert(
+                    at,
+                    SlotPlan {
+                        slot: u.slot,
+                        entries: Vec::new(),
+                        extent: 0,
+                        cbv: false,
+                        indexed: Vec::new(),
+                    },
+                );
+                at
+            });
+        let s = &mut slots[at];
+        s.entries.push(*u);
+        s.extent = s.extent.max(u.table_offset_dwords / 8);
+        s.cbv |= u.kind == ResourceType::Cbv;
+    }
+    for view in indexed {
+        if let Ok(at) = slots.binary_search_by_key(&view.table_slot, |s| s.slot) {
+            slots[at].indexed.push((
+                view.constant_slot,
+                view.constant_dword,
+                view.byte_offset,
+                view.shift,
+            ));
+        }
+    }
+    let bias = user_data
+        .iter()
+        .filter(|u| u.root == RootType::Other(vanta_shader::emit::USER_VIEW_BIAS))
+        .map(|u| u.slot)
+        .collect();
+    TablePlan { flat, slots, bias }
+}
+
+/// The slot an indexed view picks: the shader adds i32 byte offsets of
+/// root constants and shifts by 5.
+#[inline]
+fn picked(byte_offset: u32, constant: u32, shift: u8) -> u32 {
+    byte_offset.wrapping_add(constant << shift) / 32
+}
+
+/// The slots a table of `s` spans: its entries' extent, or further when
+/// an indexed view picks a slot past them.
+#[inline]
+fn table_len(s: &SlotPlan, picked_last: Option<u32>) -> u32 {
+    s.extent.max(picked_last.unwrap_or(0)) + 1
+}
+
+/// Whether the table's record words still match the copy `kept` was made
+/// from: three words a slot, compared exactly (a hash could collide and
+/// serve a stale copy).
+fn same_words(table: u64, n: u32, kept: &FreshCopy) -> bool {
+    kept.words.len() == n as usize * 3
+        && (0..n).all(|k| {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: a descriptor slot in title memory.
+            let words = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            words[..] == kept.words[k as usize * 3..k as usize * 3 + 3]
+        })
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -183,9 +297,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh in this list: (table, slot count) → the copy
+    /// the table was made from, its record words and first dynamic slot.
+    fresh_tables: std::collections::HashMap<(u64, u32), FreshCopy>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -896,10 +1010,22 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let mut made: Vec<(u8, u32)> = Vec::new();
+        let mut selected: Vec<u32> = Vec::new();
+        // One scratch of root-constant dwords for every stage.
+        let most = p
+            .stages
+            .iter()
+            .filter_map(|stage| stage.user_data)
+            .map(|(_, dwords)| dwords as usize)
+            .max()
+            .unwrap_or(0);
+        let mut values = vec![0u32; most];
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            made.clear();
+            self.tables(list, &t.plan, compute, &mut made, &mut selected);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -920,7 +1046,7 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                values[..dwords as usize].fill(0);
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -989,11 +1115,7 @@ impl State {
                         continue;
                     };
                     // The shader adds the bytes a raw view begins early by.
-                    let biased = srv
-                        && t.host.user_data.iter().any(|u| {
-                            u.slot == slot
-                                && u.root == RootType::Other(vanta_shader::emit::USER_VIEW_BIAS)
-                        });
+                    let biased = srv && t.plan.bias.contains(&slot);
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
@@ -1853,69 +1975,80 @@ impl State {
         }
     }
 
+    /// The fresh tables of a plan: bit set for a slot made afresh —
+    /// those holding a constant buffer always, and a table reaching
+    /// past a host heap smaller than the title's (the host's limit,
+    /// 1,000,000 views on NVIDIA), whose title slots have no host slot
+    /// of their own.
+    fn fresh_bits(&self, plan: &TablePlan, compute: bool) -> [u64; 4] {
+        let mut fresh = [0u64; 4];
+        for s in &plan.slots {
+            if s.cbv || self.reaches_past(s, compute) {
+                fresh[usize::from(s.slot) / 64] |= 1 << (u64::from(s.slot) % 64);
+            }
+        }
+        fresh
+    }
+
+    /// Whether the slot's table reaches past its host heap's end.
+    fn reaches_past(&self, s: &SlotPlan, compute: bool) -> bool {
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(s.slot)) else {
+            return false;
+        };
+        let Some(heap) = self.heap_of(table) else {
+            return false;
+        };
+        let Some(host) = heap.host() else {
+            return false;
+        };
+        s.entries.iter().any(|u| {
+            let end = table + u64::from(u.table_offset_dwords) * 4;
+            match heap.index(end) {
+                Some(index) => index >= host.count(),
+                None => false,
+            }
+        })
+    }
+
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
     /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// console only 16. Reports those tables' new byte offsets by root
+    /// parameter in `made`; the other tables' slots are made from the
+    /// title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// `made` and `selected` are scratch the caller holds for the whole
+    /// bind. The record words of a table are read and compared exactly on
+    /// every draw: the title may rewrite them with plain stores that pass
+    /// through no counter of ours.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
-        used: &[UsedResource],
-        indexed: &[RootIndexedView],
+        plan: &TablePlan,
         compute: bool,
-    ) -> Vec<(u8, u32)> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            if index >= host.count() {
-                fresh.push(u.slot);
-            }
-        }
-        fresh.sort_unstable();
-        fresh.dedup();
-        for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+        made: &mut Vec<(u8, u32)>,
+        selected: &mut Vec<u32>,
+    ) {
+        let fresh = self.fresh_bits(plan, compute);
+        let fresh = |slot: u8| fresh[usize::from(slot) / 64] & (1 << (u64::from(slot) % 64)) != 0;
+        // The tables the title's own slots serve, in `used` order.
+        for u in &plan.flat {
+            if !fresh(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        for s in &plan.slots {
+            if !fresh(s.slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(s.slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1925,56 +2058,37 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            selected.clear();
+            for &(constant_slot, constant_dword, byte_offset, shift) in &s.indexed {
+                let constant =
+                    self.user_value(compute, constant_slot, RootType::Constants, constant_dword);
+                selected.push(picked(byte_offset, constant, shift));
+            }
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
+            let n = table_len(s, selected.last().copied());
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
-                once!(slot, n, "fresh descriptor table exceeds the available span");
+                once!(
+                    s.slot,
+                    n,
+                    "fresh descriptor table exceeds the available span"
+                );
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+            // The copy the list made for this span, if it did.
+            let kept = self.fresh_tables.get(&(table, n));
+            if kept.is_some_and(|kept| same_words(table, n, kept)) {
+                for u in s.entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for k in selected.iter().copied() {
+                    if s.entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -1984,16 +2098,27 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((s.slot, kept.expect("the words match").first * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
-                made.push((slot, u32::MAX));
+                made.push((s.slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let mut words = Vec::with_capacity(n as usize * 3);
+            for k in 0..n {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                let record = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                words.extend_from_slice(&record);
+            }
+            // A table the title rewrote is copied anew; the slots its
+            // earlier copy holds are given back with the list's, when
+            // the list has run (`tables_done`).
+            self.fresh_tables
+                .insert((table, n), FreshCopy { words, first });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -2003,7 +2128,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = s.entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -2016,7 +2141,10 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
-                            selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                            selected
+                                .binary_search(&k)
+                                .ok()
+                                .and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
@@ -2038,14 +2166,13 @@ impl State {
                     None => {
                         host.make_null(index);
                         if used.is_some() {
-                            once!(slot, "a table entry without a view");
+                            once!(s.slot, "a table entry without a view");
                         }
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((s.slot, first * 32));
         }
-        made
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -2689,4 +2816,374 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vanta_shader::emit::UserData;
+
+    fn entry(kind: ResourceType, slot: u8, offset_dwords: u32) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        }
+    }
+
+    fn other(slot: u8) -> UsedResource {
+        UsedResource {
+            root: RootType::Constants,
+            ..entry(ResourceType::Cbv, slot, 0)
+        }
+    }
+
+    /// The plan keeps the used order for the pass over the title's own
+    /// slots, groups the tables by slot, and collects the slots a root
+    /// view reads a bias for.
+    #[test]
+    fn the_plan_groups_tables_by_slot() {
+        let used = [
+            entry(ResourceType::Cbv, 3, 0),
+            other(9),
+            entry(ResourceType::Srv, 1, 16),
+            entry(ResourceType::Srv, 3, 24),
+            entry(ResourceType::Srv, 1, 8),
+        ];
+        let indexed = [
+            RootIndexedView {
+                table_slot: 1,
+                constant_slot: 2,
+                constant_dword: 1,
+                byte_offset: 0x40,
+                shift: 5,
+            },
+            RootIndexedView {
+                table_slot: 3,
+                constant_slot: 4,
+                constant_dword: 0,
+                byte_offset: 0x20,
+                shift: 2,
+            },
+            RootIndexedView {
+                table_slot: 9,
+                constant_slot: 0,
+                constant_dword: 0,
+                byte_offset: 0,
+                shift: 0,
+            },
+        ];
+        let user_data = [
+            UserData {
+                index: 0,
+                slot: 1,
+                root: RootType::Other(vanta_shader::emit::USER_VIEW_BIAS),
+                dword: 0,
+            },
+            UserData {
+                index: 1,
+                slot: 4,
+                root: RootType::Other(vanta_shader::emit::USER_VIEW_ADDRESS),
+                dword: 0,
+            },
+            UserData {
+                index: 2,
+                slot: 3,
+                root: RootType::Other(vanta_shader::emit::USER_VIEW_BIAS),
+                dword: 0,
+            },
+        ];
+        let plan = table_plan(&used, &indexed, &user_data);
+        // The pass over the title's own slots: the used order, tables only.
+        assert_eq!(plan.flat, [used[0], used[2], used[3], used[4]]);
+        // Distinct slots, sorted.
+        assert_eq!(
+            plan.slots.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        let one = &plan.slots[0];
+        assert_eq!(one.entries, [used[2], used[4]]);
+        assert_eq!(one.extent, 2);
+        assert!(!one.cbv);
+        assert_eq!(one.indexed, [(2u8, 1u32, 0x40u32, 5u8)]);
+        let three = &plan.slots[1];
+        assert_eq!(three.entries, [used[0], used[3]]);
+        assert_eq!(three.extent, 3);
+        assert!(three.cbv);
+        // An indexed view of a slot the shader reads no table through is
+        // nothing the pass would have seen.
+        assert_eq!(three.indexed, [(4u8, 0u32, 0x20u32, 2u8)]);
+        assert_eq!(plan.bias, [1, 3]);
+    }
+
+    /// The slot an indexed view picks — the shader adds i32 byte offsets
+    /// of root constants and shifts by 5 — and the span a table covers.
+    #[test]
+    fn picked_slots_and_spans() {
+        assert_eq!(picked(0x40, 1, 5), 3);
+        assert_eq!(picked(0, 0, 5), 0);
+        // 0xffff'ffc0 + (1 << 31) wraps to 0x7fff'ffc0.
+        assert_eq!(picked(0xffff_ffc0, 1, 31), 0x7fff_ffc0 / 32);
+        let empty = SlotPlan {
+            slot: 0,
+            entries: Vec::new(),
+            extent: 0,
+            cbv: false,
+            indexed: Vec::new(),
+        };
+        assert_eq!(table_len(&empty, None), 1);
+        assert_eq!(table_len(&empty, Some(9)), 10);
+        let wide = SlotPlan { extent: 7, ..empty };
+        assert_eq!(table_len(&wide, Some(3)), 8);
+        assert_eq!(table_len(&wide, Some(63)), 64);
+    }
+
+    /// A copy matches only the words it was made from; the title may
+    /// rewrite a slot between draws, and the compare must see it in the
+    /// last slot as much as the first.
+    #[test]
+    fn a_copy_matches_only_its_own_words() {
+        // Three descriptor slots of 32 bytes, their words at their starts.
+        let mut records = vec![0u32; 3 * 8];
+        for k in 0..3usize {
+            records[8 * k..8 * k + 3].copy_from_slice(&[k as u32 + 1, k as u32 + 2, k as u32 + 3]);
+        }
+        let table = records.as_ptr() as u64;
+        let words: Vec<u32> = (0..3usize)
+            .flat_map(|k| records[8 * k..8 * k + 3].to_vec())
+            .collect();
+        let kept = FreshCopy { words, first: 7 };
+        assert!(same_words(table, 3, &kept));
+        assert!(
+            !same_words(table, 2, &kept),
+            "a shorter span is another copy"
+        );
+        records[16] = 0xffff_ffff;
+        assert!(!same_words(table, 3, &kept), "a rewritten last slot");
+        let short = FreshCopy {
+            words: vec![0; 3],
+            first: 0,
+        };
+        assert!(!same_words(table, 1, &short), "a copy of another table");
+    }
+
+    /// Without a host (no GPU on the test machines) only the constant
+    /// tables are fresh; a plain view table stays on the title's own
+    /// slots, and a root the title never set leaves it unfresh either.
+    #[test]
+    fn without_a_host_only_constant_tables_are_fresh() {
+        let (heap, cpu) = crate::descriptor::test_heap(1000);
+        let mut state = State::default();
+        state.heaps = [heap as usize, 0];
+        state.graphics = vec![Root::Table(cpu), Root::None];
+        let plan = table_plan(
+            &[
+                entry(ResourceType::Srv, 0, 8 * 300),
+                entry(ResourceType::Cbv, 1, 0),
+                other(7),
+            ],
+            &[],
+            &[],
+        );
+        let fresh = state.fresh_bits(&plan, false);
+        assert_eq!(fresh, [1 << 1, 0, 0, 0], "the constant table alone");
+        assert!(!state.reaches_past(&plan.slots[0], false));
+        state.graphics = vec![Root::None, Root::None];
+        let fresh = state.fresh_bits(&plan, false);
+        assert_eq!(fresh, [1 << 1, 0, 0, 0]);
+        // A registered heap is process state other tests feel: give it back.
+        let _ = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+    }
+
+    /// The per-draw planning of the tables pass, before (re-derived every
+    /// draw) against the plan, over one synthetic table of 63 slots. The
+    /// host steps are the same either way and need a device; this measures
+    /// what the draw itself spends. Run with:
+    /// `cargo test --release -p vanta-gpu -- --ignored --nocapture planning`
+    #[test]
+    #[ignore = "benchmark"]
+    fn planning_before_and_now() {
+        // A constant-buffer table of 63 slots, in a heap's own memory.
+        let (heap, cpu) = crate::descriptor::test_heap(1000);
+        let table = cpu;
+        for k in 0..63u32 {
+            // SAFETY: the heap holds 1000 descriptors of 32 bytes.
+            unsafe {
+                *((table + u64::from(k) * 32) as *mut [u32; 3]) =
+                    [k.wrapping_mul(2654435761), k.wrapping_mul(40503), k];
+            }
+        }
+        let used: Vec<UsedResource> = (0..8).map(|k| entry(ResourceType::Cbv, 0, k * 8)).collect();
+        let indexed = [RootIndexedView {
+            table_slot: 0,
+            constant_slot: 2,
+            constant_dword: 1,
+            // 0x720 + (5 << 5) = 0x7c0: slot 62, past the entries.
+            byte_offset: 0x720,
+            shift: 5,
+        }];
+        let user_data = [UserData {
+            index: 0,
+            slot: 3,
+            root: RootType::Other(vanta_shader::emit::USER_VIEW_BIAS),
+            dword: 0,
+        }];
+        let mut state = State::default();
+        state.heaps = [heap as usize, 0];
+        state.graphics = vec![Root::Table(table), Root::None, Root::Constants(vec![5; 4])];
+        let plan = table_plan(&used, &indexed, &user_data);
+        assert_eq!(plan.slots.len(), 1);
+        // The copy each path consults, seeded to match the table.
+        let words: Vec<u32> = (0..63u32)
+            .flat_map(|k| {
+                // SAFETY: a descriptor slot in title memory.
+                let at = (table + u64::from(k) * 32) as *const [u32; 3];
+                unsafe { *at }
+            })
+            .collect();
+        let mut now_cache: std::collections::HashMap<(u64, u32), FreshCopy> =
+            std::collections::HashMap::new();
+        now_cache.insert((table, 63), FreshCopy { words, first: 1 });
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in 0..63u32 {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+            }
+            (table, 63u32, h.finish())
+        };
+        let mut before_cache: std::collections::HashMap<(u64, u32, u64), u32> =
+            std::collections::HashMap::new();
+        before_cache.insert(key, 1);
+        let runs = 100_000u32;
+
+        let mut before_hits = 0u32;
+        let before = std::time::Instant::now();
+        for _ in 0..runs {
+            let tables = |u: &&UsedResource| u.root == RootType::Table;
+            let mut fresh: Vec<u8> = used
+                .iter()
+                .filter(tables)
+                .filter(|u| u.kind == ResourceType::Cbv)
+                .map(|u| u.slot)
+                .collect();
+            for u in used.iter().filter(tables) {
+                if fresh.contains(&u.slot) {
+                    continue;
+                }
+                let Some(&Root::Table(t)) = state.graphics.get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let end = t + u64::from(u.table_offset_dwords) * 4;
+                let Some(_heap) = state.heap_of(end) else {
+                    continue;
+                };
+                // (reaching past needs a host heap: none here)
+            }
+            fresh.sort_unstable();
+            fresh.dedup();
+            let mut made: Vec<(u8, u32)> = Vec::new();
+            for slot in fresh {
+                let entries: Vec<&UsedResource> = used
+                    .iter()
+                    .filter(tables)
+                    .filter(|u| u.slot == slot)
+                    .collect();
+                let mut selected: Vec<u32> = indexed
+                    .iter()
+                    .filter(|index| index.table_slot == slot)
+                    .map(|index| {
+                        let constant = state.user_value(
+                            false,
+                            index.constant_slot,
+                            RootType::Constants,
+                            index.constant_dword,
+                        );
+                        // The shader adds i32 byte offsets and shifts by 5.
+                        index.byte_offset.wrapping_add(constant << index.shift) / 32
+                    })
+                    .collect();
+                selected.sort_unstable();
+                selected.dedup();
+                let n = entries
+                    .iter()
+                    .map(|u| u.table_offset_dwords / 8)
+                    .chain(selected.last().copied())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    }
+                    (table, n, h.finish())
+                };
+                if before_cache.contains_key(&key) {
+                    before_hits += 1;
+                }
+                made.push((slot, 32));
+            }
+            std::hint::black_box(&made);
+        }
+        let before = before.elapsed();
+
+        let mut now_hits = 0u32;
+        let mut made: Vec<(u8, u32)> = Vec::new();
+        let mut selected: Vec<u32> = Vec::new();
+        let now = std::time::Instant::now();
+        for _ in 0..runs {
+            made.clear();
+            let fresh = state.fresh_bits(&plan, false);
+            let fresh =
+                |slot: u8| fresh[usize::from(slot) / 64] & (1 << (u64::from(slot) % 64)) != 0;
+            for s in &plan.slots {
+                if !fresh(s.slot) {
+                    continue;
+                }
+                let Some(&Root::Table(t)) = state.roots_ref(false).get(usize::from(s.slot)) else {
+                    continue;
+                };
+                let Some(heap) = state.heap_of(t) else {
+                    continue;
+                };
+                if heap.samplers() || (t - heap.start) % 32 != 0 {
+                    continue;
+                }
+                selected.clear();
+                for &(constant_slot, constant_dword, byte_offset, shift) in &s.indexed {
+                    let constant =
+                        state.user_value(false, constant_slot, RootType::Constants, constant_dword);
+                    selected.push(picked(byte_offset, constant, shift));
+                }
+                selected.sort_unstable();
+                selected.dedup();
+                let n = table_len(s, selected.last().copied());
+                if let Some(kept) = now_cache.get(&(t, n))
+                    && same_words(t, n, kept)
+                {
+                    now_hits += 1;
+                }
+                made.push((s.slot, 32));
+            }
+            std::hint::black_box(&made);
+        }
+        let now = now.elapsed();
+
+        assert_eq!(before_hits, runs, "the before path found its copy");
+        assert_eq!(now_hits, runs, "the planned path found its copy");
+        println!("planning {runs} draws of one table: before {before:?}, now {now:?}");
+        // A registered heap is process state other tests feel: give it back.
+        let _ = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+    }
 }

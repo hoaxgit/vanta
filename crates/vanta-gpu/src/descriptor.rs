@@ -958,6 +958,33 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
+/// A heap of the title's own memory for a test: no host device, so its
+/// slots are plain memory the test writes.
+#[cfg(test)]
+pub(crate) fn test_heap(count: u32) -> (This, u64) {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let extended = Extended(
+        HeapDesc {
+            kind: 0,
+            count,
+            flags: 1,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out: This = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out,),
+        crate::object::S_OK
+    );
+    let cpu = crate::object::slot::<extern "system" fn(This) -> u64>(out, 0x48)(out);
+    (out, cpu)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
