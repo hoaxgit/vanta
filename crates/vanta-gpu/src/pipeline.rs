@@ -132,6 +132,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it may store through the guest's raw-address directory.
+    /// Kept separate from `stores`, which also covers ordinary buffer views.
+    pub(crate) raw_stores: bool,
 }
 
 #[cfg(windows)]
@@ -190,6 +193,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let raw_stores = programs.is_empty() || programs.iter().any(raw_memory_stores);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -206,6 +210,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         plan,
         stores,
+        raw_stores,
     })
 }
 
@@ -351,6 +356,76 @@ fn stores(program: &vanta_shader::NativeProgram) -> bool {
             _ => false,
         }
     })
+}
+
+/// Whether a program may write through the title-memory directory. Buffer
+/// stores are tracked through their descriptor-backed Shadows instead; only
+/// FLAT/GLOBAL operations can mutate raw guest addresses. Unknown operations
+/// in those encodings conservatively retain writeback.
+#[cfg(windows)]
+fn raw_memory_stores(program: &vanta_shader::NativeProgram) -> bool {
+    use vanta_shader::gfx10::decode;
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter()
+        .any(|instruction| raw_memory_store(instruction.encoding, instruction.name()))
+}
+
+#[cfg(windows)]
+fn raw_memory_store(encoding: vanta_shader::gfx10::Encoding, name: Option<&str>) -> bool {
+    use vanta_shader::gfx10::Encoding;
+    match encoding {
+        Encoding::Flat | Encoding::Global => match name {
+            Some(name) if name.starts_with("flat_load") || name.starts_with("global_load") => false,
+            Some(name)
+                if name.starts_with("flat_store")
+                    || name.starts_with("global_store")
+                    || name.contains("atomic") =>
+            {
+                true
+            }
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod raw_memory_store_tests {
+    use super::raw_memory_store;
+    use vanta_shader::gfx10::Encoding;
+
+    #[test]
+    fn only_known_flat_and_global_loads_avoid_raw_writeback() {
+        assert!(!raw_memory_store(Encoding::Flat, Some("flat_load_dword")));
+        assert!(!raw_memory_store(
+            Encoding::Global,
+            Some("global_load_dword")
+        ));
+        assert!(raw_memory_store(Encoding::Flat, Some("flat_store_dword")));
+        assert!(raw_memory_store(
+            Encoding::Global,
+            Some("global_store_dword")
+        ));
+        assert!(raw_memory_store(
+            Encoding::Global,
+            Some("global_atomic_add")
+        ));
+        assert!(raw_memory_store(
+            Encoding::Flat,
+            Some("unknown_flat_operation")
+        ));
+        assert!(raw_memory_store(Encoding::Global, None));
+        assert!(!raw_memory_store(
+            Encoding::Scratch,
+            Some("scratch_store_dword")
+        ));
+        assert!(!raw_memory_store(
+            Encoding::Mubuf,
+            Some("buffer_store_dword")
+        ));
+    }
 }
 
 #[repr(C)]

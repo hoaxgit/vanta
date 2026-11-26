@@ -1127,6 +1127,54 @@ pub(crate) struct HostTexture {
     filled: bool,
 }
 
+/// Pins a title resource while an asynchronous texture-upload job uses its
+/// identity for descriptor notification.
+#[cfg(windows)]
+pub(crate) struct AsyncResource {
+    this: This,
+}
+
+#[cfg(windows)]
+// SAFETY: the resource is only retained as an opaque COM identity; its
+// object-specific atomic Release runs once when the job is dropped.
+unsafe impl Send for AsyncResource {}
+
+#[cfg(windows)]
+impl AsyncResource {
+    pub(crate) fn key(&self) -> usize {
+        self.this as usize
+    }
+
+    pub(crate) fn finish_ahead(&self, success: bool) {
+        finish_upload_ahead(self.this, success);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsyncResource {
+    fn drop(&mut self) {
+        resource_release(self.this);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn hold_async(this: This) -> Option<AsyncResource> {
+    if this.is_null() {
+        return None;
+    }
+    object::add_ref(this);
+    Some(AsyncResource { this })
+}
+
+#[cfg(windows)]
+pub(crate) const UPLOAD_AHEAD_NONE: u8 = 0;
+#[cfg(windows)]
+pub(crate) const UPLOAD_AHEAD_PENDING: u8 = 1;
+#[cfg(windows)]
+pub(crate) const UPLOAD_AHEAD_READY: u8 = 2;
+#[cfg(windows)]
+pub(crate) const UPLOAD_AHEAD_DIRECT: u8 = 3;
+
 /// What a title texture has on the host: its host copy and, for a depth
 /// texture shaders also write, the colour twin.
 #[cfg(windows)]
@@ -1143,6 +1191,13 @@ struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
+    /// Serializes descriptor publication against first-use COPY-queue
+    /// reservation. A descriptor maker holds a read lock through `make`;
+    /// the worker reserves the upload under the write lock.
+    descriptor_gate: std::sync::RwLock<()>,
+    /// First-use COPY-queue upload state. Set before `hosted()` publishes a
+    /// newly-created host copy, so descriptors cannot race the upload.
+    upload_ahead: std::sync::atomic::AtomicU8,
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
@@ -1275,69 +1330,274 @@ pub(crate) fn title_fills(this: This) -> bool {
 /// (`crate::descriptor::make_waiting`).
 #[cfg(windows)]
 pub(crate) fn host_waits(this: This) -> bool {
-    if this.is_null() || !lazy() {
+    if this.is_null() {
         return false;
     }
     let r = resource(this);
-    r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
-        && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    if r.desc.dimension == BUFFER || r.host.refused.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if r.host.upload_ahead.load(std::sync::atomic::Ordering::Acquire) == UPLOAD_AHEAD_PENDING {
+        return true;
+    }
+    if !lazy() {
+        return false;
+    }
+    r.host
+        .made
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+}
+
+/// Whether the host copy exists but its first-use COPY-queue upload has not
+/// completed yet.
+#[cfg(windows)]
+pub(crate) fn upload_ahead_pending(this: This) -> bool {
+    !this.is_null()
+        && resource(this).host.upload_ahead.load(std::sync::atomic::Ordering::Acquire)
+            == UPLOAD_AHEAD_PENDING
+}
+
+/// Keeps descriptor creation mutually exclusive with reserving an ahead
+/// upload. `pending` is sampled while the read lock is held.
+#[cfg(windows)]
+pub(crate) fn with_descriptor_gate<T>(this: This, make: impl FnOnce(bool) -> T) -> T {
+    if this.is_null() {
+        return make(false);
+    }
+    let r = resource(this);
+    with_upload_gate(
+        &r.host.descriptor_gate,
+        &r.host.upload_ahead,
+        make,
+    )
+}
+
+#[cfg(windows)]
+fn with_upload_gate<T>(
+    gate: &std::sync::RwLock<()>,
+    upload_ahead: &std::sync::atomic::AtomicU8,
+    make: impl FnOnce(bool) -> T,
+) -> T {
+    let _gate = gate
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let pending = upload_ahead.load(std::sync::atomic::Ordering::Acquire)
+        == UPLOAD_AHEAD_PENDING;
+    make(pending)
+}
+
+#[cfg(windows)]
+fn reserve_ahead_state(upload_ahead: &std::sync::atomic::AtomicU8) -> bool {
+    upload_ahead
+        .compare_exchange(
+            UPLOAD_AHEAD_NONE,
+            UPLOAD_AHEAD_PENDING,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+#[cfg(windows)]
+fn complete_ahead_state(upload_ahead: &std::sync::atomic::AtomicU8, success: bool) {
+    upload_ahead.store(
+        if success {
+            UPLOAD_AHEAD_READY
+        } else {
+            UPLOAD_AHEAD_NONE
+        },
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+#[cfg(windows)]
+fn reserve_direct_state(upload_ahead: &std::sync::atomic::AtomicU8) -> bool {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    loop {
+        match upload_ahead.load(Acquire) {
+            UPLOAD_AHEAD_PENDING => return false,
+            UPLOAD_AHEAD_NONE => {
+                if upload_ahead
+                    .compare_exchange(
+                        UPLOAD_AHEAD_NONE,
+                        UPLOAD_AHEAD_DIRECT,
+                        AcqRel,
+                        Acquire,
+                    )
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            UPLOAD_AHEAD_READY | UPLOAD_AHEAD_DIRECT => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn upload_ahead_state(this: This) -> u8 {
+    if this.is_null() {
+        return UPLOAD_AHEAD_NONE;
+    }
+    resource(this)
+        .host
+        .upload_ahead
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Claims a fresh COMMON-state host texture for the COPY queue. No resource
+/// that has already entered another GPU state may be sent to that queue.
+#[cfg(windows)]
+pub(crate) fn claim_upload_ahead(this: This) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if !lazy()
+        || r.desc.dimension == BUFFER
+        || !fills(&r.desc)
+        || r.host.refused.load(Acquire)
+        || r.host.gone.load(Acquire)
+    {
+        return false;
+    }
+    // Only claim before the first host copy exists. Otherwise a slot may
+    // already expose that copy to an in-flight direct-queue list.
+    let _gate = r
+        .host
+        .descriptor_gate
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if made.is_some() {
+        return false;
+    }
+    reserve_ahead_state(&r.host.upload_ahead)
+}
+
+#[cfg(windows)]
+pub(crate) fn finish_upload_ahead(this: This, success: bool) {
+    if this.is_null() {
+        return;
+    }
+    complete_ahead_state(&resource(this).host.upload_ahead, success);
+}
+
+/// Reserves a host texture for the ordinary DIRECT-list upload, so a racing
+/// indexed ahead request cannot schedule a second copy.
+#[cfg(windows)]
+pub(crate) fn claim_direct_upload(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    reserve_direct_state(&resource(this).host.upload_ahead)
 }
 
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
+    hosted_inner(this, make, false)
+}
+
+/// The ahead scheduler owns the pending reservation and is the only caller
+/// allowed to create a host copy before its COPY-queue fence completes.
+#[cfg(windows)]
+pub(crate) fn host_copy_for_ahead(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    hosted_inner(this, true, true).map(|made| made.0)
+}
+
+#[cfg(windows)]
+fn wait_for_ahead(this: This) {
+    loop {
+        if crate::texture::ahead::broken() {
+            crate::host::fail(format_args!(
+                "texture upload-ahead COPY queue failed before a host resource use"
+            ));
+        }
+        if !upload_ahead_pending(this) {
+            return;
+        }
+        match crate::texture::ahead::wait(this) {
+            crate::texture::ahead::Wait::Ready | crate::texture::ahead::Wait::Failed => {}
+            crate::texture::ahead::Wait::DeviceLost => crate::host::fail(format_args!(
+                "texture upload-ahead COPY queue failed before a host resource use"
+            )),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn hosted_inner(this: This, make: bool, allow_pending: bool) -> Option<Made> {
     use std::sync::atomic::Ordering::Relaxed;
     let r = resource(this);
     if r.desc.dimension == BUFFER {
         return None;
     }
-    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-    if made.is_none() {
-        if !make || r.host.refused.load(Relaxed) {
-            return None;
-        }
-        let clear = r
-            .host
-            .clear
-            .as_ref()
-            .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
-            r.host.refused.store(true, Relaxed);
-            return None;
-        };
-        let twin = twin_texture(&r.desc, &texture);
-        // One line per depth texture with unordered access: its address is
-        // the one target dumps and the captured frame's list of commands
-        // name.
-        if r.desc.flags & 6 == 6 {
-            tracing::info!(
-                resource = ?this,
-                desc = ?r.desc,
-                twin = twin.is_some(),
-                "depth texture with unordered access"
-            );
-        }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
-        let mut host = HostTexture::new(texture, state);
-        host.filled = fills(&r.desc);
-        if host.filled {
-            KINDS[0].fetch_add(1, Relaxed);
-            KINDS[1].fetch_add(host.bytes, Relaxed);
-        }
-        if r.host.gone.load(Relaxed) {
-            KINDS[4].fetch_add(1, Relaxed);
-            KINDS[5].fetch_add(host.bytes, Relaxed);
-        }
-        KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
-        // Slots the title wrote with views of it while it had no host copy
-        // are made before the next submission runs.
-        crate::descriptor::texture_made(this as usize);
+    if !allow_pending && crate::texture::ahead::broken() {
+        crate::host::fail(format_args!(
+            "texture upload-ahead COPY queue failed before a host resource use"
+        ));
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
-    made.clone()
+    loop {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if !allow_pending
+            && r.host.upload_ahead.load(std::sync::atomic::Ordering::Acquire)
+                == UPLOAD_AHEAD_PENDING
+        {
+            drop(made);
+            wait_for_ahead(this);
+            continue;
+        }
+        if made.is_none() {
+            if !make || r.host.refused.load(Relaxed) {
+                return None;
+            }
+            let clear = r
+                .host
+                .clear
+                .as_ref()
+                .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+            let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+                r.host.refused.store(true, Relaxed);
+                return None;
+            };
+            let twin = twin_texture(&r.desc, &texture);
+            // One line per depth texture with unordered access: its address is
+            // the one target dumps and the captured frame's list of commands
+            // name.
+            if r.desc.flags & 6 == 6 {
+                tracing::info!(
+                    resource = ?this,
+                    desc = ?r.desc,
+                    twin = twin.is_some(),
+                    "depth texture with unordered access"
+                );
+            }
+            let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+            let mut host = HostTexture::new(texture, state);
+            host.filled = fills(&r.desc);
+            if host.filled {
+                KINDS[0].fetch_add(1, Relaxed);
+                KINDS[1].fetch_add(host.bytes, Relaxed);
+            }
+            if r.host.gone.load(Relaxed) {
+                KINDS[4].fetch_add(1, Relaxed);
+                KINDS[5].fetch_add(host.bytes, Relaxed);
+            }
+            KINDS[6].fetch_add(1, Relaxed);
+            *made = Some((std::sync::Arc::new(host), twin));
+            // Slots the title wrote with views of it while it had no host copy
+            // are made before the next submission runs.
+            crate::descriptor::texture_made(this as usize);
+        }
+        r.host.used.store(crate::host::moment(), Relaxed);
+        return made.clone();
+    }
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1431,6 +1691,8 @@ pub(crate) fn let_go_idle() {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && r.host.upload_ahead.load(std::sync::atomic::Ordering::Acquire)
+                        != UPLOAD_AHEAD_PENDING
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1765,6 +2027,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
+            descriptor_gate: std::sync::RwLock::new(()),
+            upload_ahead: std::sync::atomic::AtomicU8::new(UPLOAD_AHEAD_NONE),
             state,
             // SAFETY: the title passes a whole clear value (the format,
             // then color or depth and stencil: 5 words) or null.
@@ -2279,6 +2543,262 @@ mod tests {
             mip_levels: mips,
             layout: 0,
             ..buffer(0)
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ahead_state_completion_fallback_and_direct_claim_are_consistent() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let state = AtomicU8::new(UPLOAD_AHEAD_NONE);
+        assert!(reserve_ahead_state(&state));
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_AHEAD_PENDING);
+
+        // A failure known to precede queue submission permits the existing
+        // DIRECT-list path to claim the staging upload.
+        complete_ahead_state(&state, false);
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_AHEAD_NONE);
+        assert!(reserve_direct_state(&state));
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_AHEAD_DIRECT);
+
+        let completed = AtomicU8::new(UPLOAD_AHEAD_PENDING);
+        complete_ahead_state(&completed, true);
+        assert_eq!(completed.load(Ordering::Acquire), UPLOAD_AHEAD_READY);
+        assert!(reserve_direct_state(&completed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn descriptor_gate_serializes_publication_and_ahead_reservation() {
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, RwLock, mpsc};
+
+        let gate = Arc::new(RwLock::new(()));
+        let state = Arc::new(AtomicU8::new(UPLOAD_AHEAD_NONE));
+        let published = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+
+        let maker_gate = Arc::clone(&gate);
+        let maker_state = Arc::clone(&state);
+        let maker_published = Arc::clone(&published);
+        let maker = std::thread::spawn(move || {
+            with_upload_gate(&maker_gate, &maker_state, |pending| {
+                assert!(!pending);
+                maker_published.store(true, Ordering::Release);
+                entered_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            });
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(gate.try_write().is_err());
+
+        let claim_gate = Arc::clone(&gate);
+        let claim_state = Arc::clone(&state);
+        let claimant = std::thread::spawn(move || {
+            let _write = claim_gate.write().unwrap_or_else(|e| e.into_inner());
+            reserve_ahead_state(&claim_state)
+        });
+
+        continue_tx.send(()).unwrap();
+        maker.join().unwrap();
+        assert!(claimant.join().unwrap());
+        assert!(published.load(Ordering::Acquire));
+        assert!(!with_upload_gate(&gate, &state, |pending| !pending));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn async_upload_pin_keeps_title_resource_alive() {
+        let mut memory = [0u8; 64];
+        let desc = buffer(memory.len() as u64);
+        let mut resource: This = std::ptr::null();
+        assert_eq!(
+            create_at_address(
+                std::ptr::null(),
+                memory.as_mut_ptr() as usize as u64,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut resource,
+            ),
+            S_OK
+        );
+        let pin = hold_async(resource).expect("live title resource");
+        assert_eq!(pin.key(), resource as usize);
+        assert_eq!(slot::<Release>(resource, 0x10)(resource), 1);
+        drop(pin);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ahead_copy_fence_completes_and_preserves_texture_contents() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+        if std::env::var_os("VANTA_TEXTURE_UPLOAD_AHEAD").is_some_and(|value| value == "0") {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+
+        let null = std::ptr::null();
+        for format in [28, 71] {
+            let desc = texture(4, 4, format, 1);
+            let mut resource = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON.0 as u32,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut resource,
+                ),
+                S_OK
+            );
+            let (memory, _) = texture_memory(resource).expect("title texture memory");
+            let bytes = footprint(&desc).expect("texture footprint").size as usize;
+            // SAFETY: the committed title resource owns this full allocation.
+            unsafe { std::ptr::write_bytes(memory.cast_mut(), 0x5a, bytes) };
+
+            assert!(
+                crate::texture::ahead::schedule(resource),
+                "eligible COMMON-state format {format} texture should queue on COPY"
+            );
+            assert_eq!(
+                crate::texture::ahead::wait(resource),
+                crate::texture::ahead::Wait::Ready
+            );
+            assert_eq!(
+                upload_ahead_state(resource),
+                UPLOAD_AHEAD_READY,
+                "the host texture must not be ready before its COPY fence"
+            );
+            let host_texture = host_resource(resource).expect("uploaded host texture");
+            let host_desc = unsafe { host_texture.GetDesc() };
+            let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()];
+            let mut rows = [0u32];
+            let mut row_sizes = [0u64];
+            let mut total = 0u64;
+            // SAFETY: output arrays each cover the texture's sole subresource.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &host_desc,
+                    0,
+                    1,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    Some(row_sizes.as_mut_ptr()),
+                    Some(&mut total),
+                );
+            }
+            assert!(total > 0 && rows[0] > 0 && row_sizes[0] > 0);
+            let readback_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a readback buffer covering all rows.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &readback_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+            }
+            let readback = readback.unwrap();
+            let (_, before) =
+                host_transition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32).unwrap();
+            assert_eq!(before, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+            let (_, source_state) = host_transition(resource, before).unwrap();
+            assert_eq!(source_state, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the readback resource stays live through execution.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprints[0],
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: the title resource keeps its host texture alive.
+                pResource: unsafe { std::mem::transmute_copy(host_texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let back = host.new_list().unwrap();
+            // SAFETY: the list transitions the live host texture, copies its
+            // only subresource, and restores the tracked COMMON state.
+            unsafe {
+                back.list.ResourceBarrier(&[crate::host::transition(
+                    host_texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                back.list
+                    .CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                back.list.ResourceBarrier(&[crate::host::transition(
+                    host_texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATES(before as i32),
+                )]);
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            let read_range = D3D12_RANGE {
+                Begin: 0,
+                End: total as usize,
+            };
+            // SAFETY: execute waited for the readback copy; map its allocation.
+            let read = unsafe {
+                readback
+                    .Map(0, Some(&read_range), Some(&mut mapped))
+                    .unwrap();
+                std::slice::from_raw_parts(mapped.cast::<u8>(), total as usize)
+            };
+            let footprint = footprints[0].Footprint;
+            for row in 0..rows[0] as usize {
+                let start =
+                    footprints[0].Offset as usize + row * footprint.RowPitch as usize;
+                let row_bytes = row_sizes[0] as usize;
+                assert!(
+                    read[start..start + row_bytes].iter().all(|&byte| byte == 0x5a),
+                    "format {format} row {row} did not match the title contents"
+                );
+            }
+            let written_range = D3D12_RANGE { Begin: 0, End: 0 };
+            // SAFETY: the mapping is no longer read.
+            unsafe { readback.Unmap(0, Some(&written_range)) };
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
         }
     }
 

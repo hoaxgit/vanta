@@ -95,9 +95,10 @@ your files. Environment variables win over the file:
 | `VANTA_DATA_DIR` | where titles keep saves — persistent local storage (default `%LOCALAPPDATA%\vanta\data`) |
 | `VANTA_TEST_TITLES` | further Xbox Series titles for exercising platform-level code (`;`-separated) |
 | `VANTA_CONFIG` | use a different config file |
+| `VANTA_TEXTURE_UPLOAD_AHEAD` | use the first-use D3D12 COPY-queue worker for eligible indexed textures (default `1`; set `0` to disable) |
 
-Every path must sit outside this repository; the tooling refuses anything
-else (`docs/asset-policy.md`).
+Every path setting must sit outside this repository; the tooling refuses
+anything else (`docs/asset-policy.md`).
 
 ## Tuning performance (optional, off by default)
 
@@ -136,6 +137,68 @@ $env:VANTA_CARD_REHASH_RUNS   = "1"
 
 These come from one machine's measurements; they relocate buffer
 bookkeeping, they do not remove the CPU bottleneck.
+
+## First-use indexed texture uploads
+
+On Windows, the GPU backend lazily creates a bounded D3D12 COPY-queue worker
+pool for eligible first-use indexed textures. A texture is eligible only when
+the title fills it, its host copy is new and in `COMMON`, its title memory is
+committed, and it is not an alias, host-written texture, or already-staged
+resource. Ineligible textures continue through the existing DIRECT-queue
+path.
+
+While a COPY upload is pending, indexed heap descriptors remain null and are
+published after the worker's fence completes. Explicit table uses and other
+direct resource uses wait for a pending upload. Failures known to precede
+submission fall back to the DIRECT path. If submitted work cannot be fenced,
+Vanta treats the host GPU as failed and does not publish or recycle resources
+that the GPU may still be using.
+
+Set `VANTA_TEXTURE_UPLOAD_AHEAD=0` before launch to disable the worker and use
+the DIRECT path for comparison. No controlled before/after performance run is
+currently documented, so this option is not claimed to improve FPS. The
+worker is process-lifetime: Vanta has no graceful in-process host-device
+teardown hook, and the current title shutdown path terminates the process.
+
+Verified so far: the ahead states, gates and pinning have unit tests, and a
+GPU test reads a texture back after a scheduled COPY-queue upload to confirm
+the fence completed and the contents survived; it passes on the only machine
+used for testing, an NVIDIA RTX 5060. Boot smoke runs of the current title
+with the same binary show the worker engaging with
+`VANTA_TEXTURE_UPLOAD_AHEAD=1` (the log names the first upload; no
+upload-ahead failure appears) and no such line with `=0`. Both settings ran
+the same boot arc until the run ended at an out-of-memory error in the
+card's writeback fetch — the `=0` run hit it too, so that failure is not
+this option's doing. No gameplay or frame-rate comparison exists; AMD
+compatibility and other vendor/driver combinations have not been separately
+validated.
+
+For a controlled local comparison, keep the game, save, scene, resolution,
+settings, shader cache, and background load the same. Warm both configurations
+first, then repeat each several times and save each run's `%TEMP%\vanta.log`:
+
+```powershell
+$game = "<game folder>\<game executable>"
+$env:VANTA_TEXTURE_UPLOAD_AHEAD = "1"
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game $game
+Copy-Item "$env:TEMP\vanta.log" "$env:TEMP\vanta-ahead-on.log"
+
+$env:VANTA_TEXTURE_UPLOAD_AHEAD = "0"
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game $game
+Copy-Item "$env:TEMP\vanta.log" "$env:TEMP\vanta-ahead-off.log"
+```
+
+Record FPS and frame-time variation from the logs, texture correctness,
+visible stalls, crashes or device-loss events. Sample GPU utilization and
+memory in a second PowerShell window during each run, stopping with Ctrl+C:
+
+```powershell
+nvidia-smi --query-gpu=timestamp,name,utilization.gpu,utilization.memory,memory.used,temperature.gpu,power.draw --format=csv -l 1 |
+    Tee-Object "$env:TEMP\vanta-gpu-samples.csv"
+```
+
+Use a separate output filename for the other configuration. Record CPU
+utilization from Task Manager or Performance Monitor if available.
 
 ## Tools and diagnostics
 

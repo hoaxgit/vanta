@@ -1033,7 +1033,7 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
+            let writes = (t.raw_stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&vanta_shader::emit::SLOT_MEMORY) {
@@ -1198,6 +1198,7 @@ impl State {
         compute: bool,
         writes: bool,
     ) -> bool {
+        let _mapping = crate::watch::title_memory_reading();
         const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -1627,6 +1628,11 @@ impl State {
             if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
                 break;
             }
+            if crate::texture::ahead::broken() {
+                crate::host::fail(format_args!(
+                    "texture upload-ahead COPY queue lost its fence"
+                ));
+            }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1682,7 +1688,16 @@ impl State {
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let handle = heap.handle(index);
+            if let Some(handle) = handle
+                && let Some(View::Shader(resource, _)) = crate::descriptor::view(handle)
+            {
+                let resource = resource as This;
+                if crate::resource::title_fills(resource) {
+                    let _ = crate::texture::ahead::schedule(resource);
+                }
+            }
+            let view = handle.and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1691,10 +1706,21 @@ impl State {
                     continue;
                 }
             };
-            let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            let title_fills = crate::resource::title_fills(resource);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
                 host.texture_slot_done(index, write, None);
+                continue;
+            }
+            // The COPY-queue worker owns the staging bytes and will notify
+            // descriptor waiters only after its fence completes.
+            if crate::resource::upload_ahead_pending(resource) {
+                if crate::texture::ahead::broken() {
+                    crate::host::fail(format_args!(
+                        "texture upload-ahead COPY queue failed before indexed texture publication"
+                    ));
+                }
+                host.texture_slot_later(index, write, frame, 1);
                 continue;
             }
             // A texture that has a staging buffer now is one draws read
@@ -1966,7 +1992,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some(view) = host.mirror_for_table(index, handle) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2676,6 +2702,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    let _mapping = crate::watch::title_memory_reading();
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -2696,8 +2723,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
     }
+    drop(_mapping);
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
+            if crate::resource::upload_ahead_pending(*resource as This) {
+                return;
+            }
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).

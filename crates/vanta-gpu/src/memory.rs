@@ -44,8 +44,9 @@
 //! compared on the CPU afterwards, as for any unordered access view): a
 //! dirty-page mask written by the shader would bound both.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use vanta_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -62,6 +63,170 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+#[derive(Clone, Copy)]
+struct RemapRange {
+    end: usize,
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct Remaps {
+    epoch: u64,
+    /// Disjoint ranges, each tagged with their most recent remap epoch.
+    ranges: BTreeMap<usize, RemapRange>,
+}
+
+static REMAPS: LazyLock<Mutex<Remaps>> = LazyLock::new(|| Mutex::new(Remaps::default()));
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn insert_remap(
+    ranges: &mut BTreeMap<usize, RemapRange>,
+    mut start: usize,
+    mut end: usize,
+    epoch: u64,
+) {
+    if let Some((&previous, range)) = ranges.range(..start).next_back()
+        && range.end == start
+        && range.epoch == epoch
+    {
+        start = previous;
+        ranges.remove(&previous);
+    }
+    if let Some((&next, range)) = ranges.range(start..).next()
+        && next == end
+        && range.epoch == epoch
+    {
+        end = range.end;
+        ranges.remove(&next);
+    }
+    ranges.insert(start, RemapRange { end, epoch });
+}
+
+fn record_remap(ranges: &mut Remaps, start: usize, end: usize) -> u64 {
+    ranges.epoch = ranges.epoch.wrapping_add(1).max(1);
+    let epoch = ranges.epoch;
+    // Keep disjoint history in place: mapping changes are frequent, while
+    // each one generally touches only a few of the tracked intervals.
+    let first = ranges
+        .ranges
+        .range(..=start)
+        .next_back()
+        .filter(|(_, range)| range.end > start)
+        .map_or(start, |(&from, _)| from);
+    let overlapping: Vec<_> = ranges
+        .ranges
+        .range(first..end)
+        .map(|(&from, &range)| (from, range))
+        .collect();
+    for &(from, _) in &overlapping {
+        ranges.ranges.remove(&from);
+    }
+    for (from, range) in overlapping {
+        if from < start {
+            insert_remap(&mut ranges.ranges, from, start, range.epoch);
+        }
+        if range.end > end {
+            insert_remap(&mut ranges.ranges, end, range.end, range.epoch);
+        }
+    }
+    insert_remap(&mut ranges.ranges, start, end, epoch);
+    epoch
+}
+
+/// The current title-memory mapping epoch, captured when a GPU write is
+/// declared. A later remap makes only its overlapping bytes ineligible for
+/// publication from that flight.
+pub(crate) fn writeback_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// A title-memory mapping changed. Track page-rounded ranges: the contents
+/// and owner of a physical page change together, even if the caller supplied
+/// a sub-page view interval.
+pub(crate) fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mask = PAGE as usize - 1;
+    let start = at & !mask;
+    let raw_end = at.saturating_add(len);
+    let end = raw_end.saturating_add(mask) & !mask;
+    if start < end {
+        let mut remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let epoch = record_remap(&mut remaps, start, end);
+        REMAP_EPOCH.store(epoch, Ordering::Release);
+    }
+}
+
+fn remapped_since(epoch: u64) -> (u64, Vec<(usize, usize)>) {
+    let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let ranges = remaps
+        .ranges
+        .iter()
+        .filter_map(|(&start, range)| (range.epoch > epoch).then_some((start, range.end)))
+        .collect();
+    (remaps.epoch, ranges)
+}
+
+/// The parts of `[start,end)` that still have the mapping captured by
+/// `epoch`. Caller holds the title-memory read lock through publication.
+pub(crate) fn publishable_ranges(epoch: u64, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    publishable_ranges_in(&remaps, epoch, start, end)
+}
+
+fn publishable_ranges_in(
+    remaps: &Remaps,
+    epoch: u64,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut cursor = start;
+    let mut safe = Vec::new();
+    if let Some((&from, range)) = remaps.ranges.range(..=start).next_back()
+        && from < end
+        && range.end > start
+        && range.epoch > epoch
+    {
+        cursor = range.end.min(end);
+    }
+    for (&from, range) in remaps.ranges.range(start..end) {
+        if range.end <= cursor || range.epoch <= epoch {
+            continue;
+        }
+        if from > cursor {
+            safe.push((cursor, from.min(end)));
+        }
+        cursor = range.end.min(end);
+        if cursor >= end {
+            break;
+        }
+    }
+    if cursor < end {
+        safe.push((cursor, end));
+    }
+    safe
+}
+
+fn clear_directory_pages(directory: &mut [u32], pages: u32, ranges: &[(usize, usize)]) {
+    for &(start, end) in ranges {
+        let first = (start as u64 / PAGE) as usize;
+        let last = (end as u64)
+            .div_ceil(PAGE)
+            .min(u64::from(pages.saturating_sub(1))) as usize;
+        for page in first..last {
+            let at = page * 2;
+            if at + 1 < directory.len() {
+                directory[at] = 0;
+                directory[at + 1] = 0;
+            }
+        }
+    }
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
@@ -75,6 +240,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Remaps already reflected in `directory`.
+    directory_epoch: u64,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,7 +278,42 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            directory_epoch: writeback_epoch(),
         })
+    }
+
+    /// Publish remaps to a new directory version. Lists already recorded
+    /// keep their previous resource and therefore retain the owners they
+    /// observed; new lists see the cleared entries and resolve the new owner.
+    fn apply_remaps(&mut self, host: &crate::host::Host) -> bool {
+        if writeback_epoch() == self.directory_epoch {
+            return true;
+        }
+        let (epoch, changed) = remapped_since(self.directory_epoch);
+        if changed.is_empty() {
+            self.directory_epoch = epoch;
+            return true;
+        }
+        let dwords = u64::from(MEMORY_PAGES) * 2;
+        let Some((resource, data)) = host.shared_buffer(dwords * 4) else {
+            return false;
+        };
+        let directory = data.cast::<u32>();
+        // SAFETY: both mappings hold the full directory and are distinct
+        // shared buffers; the new buffer is not visible to submitted lists.
+        unsafe { std::ptr::copy_nonoverlapping(self.directory.1, directory, dwords as usize) };
+        // SAFETY: the new shared mapping contains `dwords` writable entries.
+        let entries = unsafe { std::slice::from_raw_parts_mut(directory, dwords as usize) };
+        clear_directory_pages(entries, MEMORY_PAGES, &changed);
+        // SAFETY: the new resource is live.
+        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        self.directory = (resource, directory, gpu);
+        self.directory_epoch = epoch;
+        tracing::debug!(
+            pages = changed.len(),
+            "raw memory directory remapped with copy-on-write"
+        );
+        true
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -246,11 +448,19 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: bool,
 ) -> Option<Ready> {
+    let _mapping = crate::watch::title_memory_reading();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    let Some(host) = host() else { return None };
+    if !m.apply_remaps(&host) {
+        tracing::warn!(
+            "raw memory directory could not be versioned after a remap; dropping this dispatch"
+        );
+        return None;
+    }
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -307,8 +517,10 @@ pub(crate) fn ready(
             shadow.gpu_writes(list, start, len);
         }
     }
-    if first_read {
+    if list.first_use(m.directory.2 as usize) {
         list.keep(&m.directory.0);
+    }
+    if first_read {
         list.keep(&m.faults.0);
     }
     Some(Ready {
@@ -316,4 +528,79 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Remaps, clear_directory_pages, publishable_ranges_in, record_remap};
+
+    #[test]
+    fn remaps_only_suppress_overlapping_bytes_from_older_flights() {
+        let mut remaps = Remaps::default();
+        let before = remaps.epoch;
+        let first = record_remap(&mut remaps, 0x1_0000, 0x2_0000);
+        assert_eq!(
+            publishable_ranges_in(&remaps, before, 0x8000, 0x28000),
+            vec![(0x8000, 0x1_0000), (0x2_0000, 0x28000)]
+        );
+        assert_eq!(
+            publishable_ranges_in(&remaps, before, 0x1_8000, 0x2_8000),
+            vec![(0x2_0000, 0x2_8000)]
+        );
+        assert_eq!(
+            publishable_ranges_in(&remaps, first, 0x8000, 0x28000),
+            vec![(0x8000, 0x28000)]
+        );
+
+        let second = record_remap(&mut remaps, 0x1_8000, 0x2_0000);
+        assert_eq!(
+            publishable_ranges_in(&remaps, first, 0x1_0000, 0x2_8000),
+            vec![(0x1_0000, 0x1_8000), (0x2_0000, 0x2_8000)]
+        );
+        assert_eq!(
+            publishable_ranges_in(&remaps, second, 0x1_0000, 0x2_8000),
+            vec![(0x1_0000, 0x2_8000)]
+        );
+    }
+
+    #[test]
+    fn remaps_preserve_both_sides_of_an_overlapped_interval() {
+        let mut remaps = Remaps::default();
+        let before = record_remap(&mut remaps, 0x1_0000, 0x5_0000);
+        record_remap(&mut remaps, 0x2_0000, 0x3_0000);
+
+        assert_eq!(
+            publishable_ranges_in(&remaps, before, 0x1_0000, 0x5_0000),
+            vec![(0x1_0000, 0x2_0000), (0x3_0000, 0x5_0000)]
+        );
+    }
+
+    #[test]
+    fn remaps_preserve_disjoint_history() {
+        let mut remaps = Remaps::default();
+        let before = remaps.epoch;
+        record_remap(&mut remaps, 0x1_0000, 0x2_0000);
+        let second = record_remap(&mut remaps, 0x4_0000, 0x5_0000);
+
+        assert_eq!(
+            publishable_ranges_in(&remaps, before, 0, 0x6_0000),
+            vec![(0, 0x1_0000), (0x2_0000, 0x4_0000), (0x5_0000, 0x6_0000)]
+        );
+        assert_eq!(
+            publishable_ranges_in(&remaps, second, 0, 0x6_0000),
+            vec![(0, 0x6_0000)]
+        );
+    }
+
+    #[test]
+    fn remap_directory_clear_only_zeros_overlapping_guest_pages() {
+        let mut directory = (1..=16).collect::<Vec<u32>>();
+        clear_directory_pages(&mut directory, 8, &[(0x1_0000, 0x2_0000)]);
+        assert_eq!(&directory[0..2], &[1, 2]);
+        assert_eq!(&directory[2..4], &[0, 0]);
+        assert_eq!(
+            &directory[4..],
+            &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
 }

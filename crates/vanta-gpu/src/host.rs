@@ -1529,6 +1529,8 @@ struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     /// As declared (title addresses), for the statistics.
     declared: (usize, usize),
+    /// Physical-memory mapping generation when the GPU write was recorded.
+    remap_epoch: u64,
     span: crate::shadow::CardSpan,
     /// Its first piece's dword in the compare's results.
     at: u32,
@@ -1549,6 +1551,21 @@ struct CardPlan {
     lists: Vec<(bool, Prelude)>,
 }
 
+/// The pieces of a Shadow-relative range whose title-memory backing has not
+/// changed since the shader write was recorded.
+fn publishable_shadow_ranges(
+    shadow: &crate::shadow::Shadow,
+    epoch: u64,
+    from: usize,
+    to: usize,
+) -> Vec<(usize, usize)> {
+    let base = shadow.span().0 as usize;
+    crate::memory::publishable_ranges(epoch, base.saturating_add(from), base.saturating_add(to))
+        .into_iter()
+        .map(|(from, to)| (from - base, to - base))
+        .collect()
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -1565,7 +1582,7 @@ enum Step {
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1889,7 +1906,7 @@ fn late_writes() -> bool {
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>, u64);
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -2406,17 +2423,20 @@ fn relay_worker() {
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
 fn relay_hand_back(back: &[Declared]) {
-    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for (shadow, declared) in back {
+    let _reading = crate::watch::title_memory_reading();
+    let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+    for (shadow, declared, epoch) in back {
         if shadow.carded() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
+        for &(from, to) in declared {
+            join_ranges(&mut spans, crate::memory::publishable_ranges(*epoch, from, to));
+        }
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
-        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+        work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to, *epoch)));
     }
     if work.is_empty() {
         return;
@@ -2426,14 +2446,23 @@ fn relay_hand_back(back: &[Declared]) {
     // Looked through without a lock: a piece that changes meanwhile (a
     // later flight writing, the title's bytes going in) is found now or by
     // that flight's landing, and the merge looks again under the lock.
-    let found = crate::shadow::find_all(&work);
+    let ranges: Vec<_> = work
+        .iter()
+        .map(|(shadow, from, to, _)| (shadow.clone(), *from, *to))
+        .collect();
+    let found = crate::shadow::find_all(&ranges);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     let (mut now, mut title) = (Vec::new(), Vec::new());
-    for ((shadow, from, to), found) in work.iter().zip(found) {
+    for ((shadow, from, to, epoch), found) in work.iter().zip(found) {
         let mut written = 0;
         for (at, n) in found {
-            written += shadow.relay_merge(at, n, &mut now, &mut title);
+            let base = shadow.span().0 as usize;
+            for (start, end) in
+                crate::memory::publishable_ranges(*epoch, base + at, base + at + n)
+            {
+                written += shadow.relay_merge(start - base, end - start, &mut now, &mut title);
+            }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -2616,15 +2645,18 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, epoch) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
+                match back
+                    .iter_mut()
+                    .find(|(s, _, e)| std::sync::Arc::ptr_eq(s, shadow) && e == epoch)
+                {
+                    Some((_, ranges, _)) => {
                         if !ranges.contains(&range) {
                             ranges.push(range);
                         }
                     }
-                    None => back.push((shadow.clone(), vec![range])),
+                    None => back.push((shadow.clone(), vec![range], *epoch)),
                 }
             }
         }
@@ -2660,11 +2692,12 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    let _reading = crate::watch::title_memory_reading();
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
+        for (shadow, declared, epoch) in back {
             if shadow.carded() {
                 continue;
             }
@@ -2672,9 +2705,11 @@ fn hand_back(back: &[Declared]) {
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
             for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
+                for (from, to) in crate::memory::publishable_ranges(*epoch, from, to) {
+                    match spans.last_mut() {
+                        Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                        _ => spans.push((from, to)),
+                    }
                 }
             }
             work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
@@ -2690,12 +2725,12 @@ fn hand_back(back: &[Declared]) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
-        for (shadow, declared) in back {
+        for (shadow, declared, _) in back {
             shadow.copy_back_done(declared);
         }
         return;
     }
-    for (shadow, declared) in back {
+    for (shadow, declared, epoch) in back {
         if shadow.carded() {
             // Done before (`Host::card_back`).
             shadow.copy_back_done(declared);
@@ -2717,10 +2752,12 @@ fn hand_back(back: &[Declared]) {
             }
         }
         for (from, to) in spans {
-            let written = shadow.copy_back(from, to - from);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            for (from, to) in crate::memory::publishable_ranges(*epoch, from, to) {
+                let written = shadow.copy_back(from, to - from);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(from, to - from, written);
+            }
         }
         shadow.copy_back_done(declared);
     }
@@ -2973,20 +3010,23 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut declared: Vec<Declared> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, epoch) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
+                    match declared
+                        .iter_mut()
+                        .find(|(s, _, e)| Arc::ptr_eq(s, shadow) && e == epoch)
+                    {
+                        Some((_, ranges, _)) => {
                             if !ranges.contains(&range) {
                                 ranges.push(range);
                             }
                         }
-                        None => declared.push((shadow.clone(), vec![range])),
+                        None => declared.push((shadow.clone(), vec![range], *epoch)),
                     }
                 }
             }
@@ -3010,7 +3050,7 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
-        for (shadow, _) in &declared {
+        for (shadow, _, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -3100,7 +3140,7 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        for (shadow, ranges, remap_epoch) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3119,6 +3159,7 @@ impl Host {
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
+                    remap_epoch: *remap_epoch,
                     span,
                     at,
                     compared,
@@ -3242,7 +3283,13 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut pieces: Vec<(
+            std::sync::Arc<crate::shadow::Shadow>,
+            usize,
+            usize,
+            u64,
+            u64,
+        )> = Vec::new();
         let mut total = 0u64;
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
@@ -3269,9 +3316,13 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
+                        for (lo, hi) in
+                            publishable_shadow_ranges(&r.shadow, r.remap_epoch, lo, hi)
+                        {
+                            if lo < hi && seen.insert((copy, lo, hi, r.remap_epoch)) {
+                                pieces.push((r.shadow.clone(), lo, hi, total, r.remap_epoch));
+                                total += (hi - lo) as u64;
+                            }
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -3306,7 +3357,7 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
+                for (shadow, lo, hi, at, _) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
                 list.Close()?;
@@ -3339,11 +3390,16 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
+        let _reading = crate::watch::title_memory_reading();
+        for (shadow, lo, hi, at, epoch) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            for (safe_lo, safe_hi) in publishable_shadow_ranges(shadow, *epoch, *lo, *hi) {
+                let offset = safe_lo - lo;
+                let gpu = &gpu[offset..offset + (safe_hi - safe_lo)];
+                written += shadow.card_merge_relay(safe_lo, gpu, after, &mut title);
+            }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3384,16 +3440,19 @@ impl Host {
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    for (shadow, ranges, epoch) in &flight.back {
+                        match back
+                            .iter_mut()
+                            .find(|(s, _, e)| std::sync::Arc::ptr_eq(s, shadow) && e == epoch)
+                        {
+                            Some((_, all, _)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((shadow.clone(), ranges.clone(), *epoch)),
                         }
                     }
                 }
@@ -3401,7 +3460,7 @@ impl Host {
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
+                    for (shadow, ranges, _) in &flight.back {
                         shadow.copy_back_done(ranges);
                     }
                 }
@@ -3456,7 +3515,7 @@ impl Host {
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.back.iter().flat_map(|(_, r, _)| r.iter().copied()));
                 }
             }
             join_ranges(written, ranges);
@@ -3480,7 +3539,7 @@ impl Host {
         &self,
         plan: &CardPlan,
         submitted: &mut u64,
-        seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        seen: &mut std::collections::HashSet<(usize, usize, usize, u64)>,
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -3494,7 +3553,7 @@ impl Host {
         let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
-        let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
+        let mut pieces: Vec<(usize, usize, usize, u64, u64)> = Vec::new();
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
@@ -3502,9 +3561,12 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                for (lo, hi) in publishable_shadow_ranges(&r.shadow, r.remap_epoch, lo, hi) {
+                    if lo < hi && seen.insert((copy, lo, hi, r.remap_epoch)) {
+                        pieces.push((i, lo, hi, total, r.remap_epoch));
+                        total += (hi - lo) as u64;
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -3526,7 +3588,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    for &(i, lo, hi, at, _) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
@@ -3552,14 +3614,25 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
+            // Re-check after the readback fence while physical-page remaps
+            // are excluded; a remap may have started while the fetch ran.
+            let _reading = crate::watch::title_memory_reading();
+            let mut publish = Vec::new();
+            for &(i, lo, hi, at, epoch) in &pieces {
+                let shadow = &plan.ranges[i].shadow;
+                for (safe_lo, safe_hi) in publishable_shadow_ranges(shadow, epoch, lo, hi) {
+                    let offset = at + (safe_lo - lo) as u64;
+                    publish.push((i, safe_lo, safe_hi, offset));
+                }
+            }
+            if wide_merge() && publish.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
                 let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
                     std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
+                let each = publish.len().div_ceil(8);
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = publish
                     .chunks(each)
                     .map(|chunk| {
                         let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
@@ -3583,7 +3656,7 @@ impl Host {
                 }
             } else {
                 let mut title = Vec::new();
-                for &(i, lo, hi, at) in &pieces {
+                for &(i, lo, hi, at) in &publish {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
@@ -3631,7 +3704,12 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges, _)| ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3675,7 +3753,12 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges, _)| ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -3794,16 +3877,19 @@ impl Host {
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
                     }
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    for (shadow, ranges, epoch) in &flight.back {
+                        match back
+                            .iter_mut()
+                            .find(|(s, _, e)| std::sync::Arc::ptr_eq(s, shadow) && e == epoch)
+                        {
+                            Some((_, all, _)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((shadow.clone(), ranges.clone(), *epoch)),
                         }
                     }
                 }
@@ -4908,9 +4994,12 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        self.deferred().copies.push(Step::GpuWrite(
+            shadow.clone(),
+            address,
+            len,
+            crate::memory::writeback_epoch(),
+        ));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5075,7 +5164,13 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let steps = &self.deferred().copies;
+        let mut at = 0;
+        while let Some(step) = steps.get(at) {
+            if !matches!(step, Step::Texture(_)) {
+                batch.flush_textures();
+            }
+            at += 1;
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -5125,7 +5220,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -5142,9 +5237,17 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture(_) => {
+                    // Keep adjacent texture checks pending across list
+                    // boundaries too. The submission owns one Batch, and
+                    // each non-texture step drains it before doing anything
+                    // observable to a later refresh.
+                    if let Step::Texture(staging) = step {
+                        batch.queue_texture(staging);
+                    }
+                    while let Some(Step::Texture(staging)) = steps.get(at) {
+                        batch.queue_texture(staging);
+                        at += 1;
                     }
                     continue;
                 }
@@ -5188,8 +5291,47 @@ struct Batch {
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
     index: std::collections::HashMap<usize, usize>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Textures due since the last title write, with pending work kept across
+    /// adjacent lists in this submission.
+    textures: TextureBatch<crate::texture::Staging>,
+}
+
+/// Texture refreshes accumulated over adjacent deferred steps.
+///
+/// Draining pending work does not clear `seen`: sampling the same texture in
+/// another list of the submission must not refresh it again until a title
+/// write makes its bytes stale.
+struct TextureBatch<T> {
+    seen: std::collections::HashSet<usize>,
+    pending: Vec<std::sync::Arc<T>>,
+}
+
+impl<T> Default for TextureBatch<T> {
+    fn default() -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl<T> TextureBatch<T> {
+    fn queue(&mut self, texture: &std::sync::Arc<T>) -> bool {
+        let key = std::sync::Arc::as_ptr(texture) as *const () as usize;
+        if !self.seen.insert(key) {
+            return false;
+        }
+        self.pending.push(texture.clone());
+        true
+    }
+
+    fn take(&mut self) -> Vec<std::sync::Arc<T>> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn clear_seen(&mut self) {
+        self.seen.clear();
+    }
 }
 
 impl Batch {
@@ -5235,18 +5377,34 @@ impl Batch {
 
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
+    #[cfg(test)]
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        self.textures
+            .seen
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    fn queue_texture(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) -> bool {
+        self.textures.queue(staging)
+    }
+
+    /// Refreshes textures gathered since the preceding non-texture step.
+    fn flush_textures(&mut self) {
+        let pending = self.textures.take();
+        if !pending.is_empty() {
+            crate::texture::refresh_all(pending);
+        }
     }
 
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
-        self.textures.clear();
+        self.textures.clear_seen();
     }
 
     fn flush(&mut self) {
+        self.flush_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -6408,8 +6566,9 @@ mod spare {
 }
 
 #[cfg(test)]
-mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+mod batch {
+    // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+    use super::{Batch, TextureBatch};
     use std::sync::Arc;
 
     #[test]
@@ -6439,6 +6598,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn adjacent_lists_share_pending_texture_refreshes() {
+        let mut textures = TextureBatch::default();
+        let (a, b) = (Arc::new(1u32), Arc::new(2u32));
+
+        // The end of one list and start of the next are adjacent deferred
+        // texture steps in a single submission.
+        assert!(textures.queue(&a));
+        assert!(textures.queue(&b));
+        assert!(!textures.queue(&a.clone()));
+
+        let pending = textures.take();
+        assert_eq!(pending.len(), 2);
+        assert!(Arc::ptr_eq(&pending[0], &a));
+        assert!(Arc::ptr_eq(&pending[1], &b));
+
+        // Draining work does not make a texture due again until title writes.
+        assert!(!textures.queue(&a));
+        textures.clear_seen();
+        assert!(textures.queue(&a));
     }
 
     /// The hashing a submission does for textures in physical-page memory,

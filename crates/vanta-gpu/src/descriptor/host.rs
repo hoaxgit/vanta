@@ -1080,7 +1080,33 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let resource = match view {
+            View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+                Some(*resource as crate::object::This)
+            }
+            _ => None,
+        };
+        let kept = if let Some(resource) = resource {
+            loop {
+                let made = crate::resource::with_descriptor_gate(resource, |pending| {
+                    (!pending).then(|| make(view, self.cpu(index)))
+                });
+                if let Some(made) = made {
+                    break made;
+                }
+                match crate::texture::ahead::wait(resource) {
+                    crate::texture::ahead::Wait::Ready
+                    | crate::texture::ahead::Wait::Failed => {}
+                    crate::texture::ahead::Wait::DeviceLost => {
+                        crate::host::fail(format_args!(
+                            "texture upload-ahead COPY queue failed before dynamic descriptor publication"
+                        ));
+                    }
+                }
+            }
+        } else {
+            make(view, self.cpu(index))
+        };
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -1239,6 +1265,22 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_impl(index, handle, for_draw, false)
+    }
+
+    /// Makes a table entry used by this draw. Unlike an indexed heap slot,
+    /// the draw cannot run with a null entry while its COPY upload is pending.
+    pub(crate) fn mirror_for_table(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_impl(index, handle, true, true)
+    }
+
+    fn mirror_impl(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        wait_for_ahead: bool,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1257,9 +1299,9 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -1272,51 +1314,96 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
+        let resource = match &view {
+            View::Shader(resource, _) | View::Unordered(resource, _, _) => {
+                Some(*resource as crate::object::This)
+            }
+            _ => None,
+        };
+        loop {
+            let publish = |upload_pending: bool| {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                if made[index as usize] != key {
+                    // Views of other textures in the memory this one describes
+                    // are stale: their host slots read nothing from here on, and
+                    // let go of the host copies they held.
+                    for stale in self.note_buffer(index, Some(&view), for_draw) {
+                        if stale != index {
+                            self.unmake(&mut made, stale);
+                        }
+                    }
+                    // A view of a texture object that has no host copy yet waits
+                    // for it, as buffer views wait for a draw: the slot is made
+                    // when the texture is first used (`super::make_waiting`), or
+                    // here when a draw reads the slot through a table.
+                    let waiting = if for_draw && !upload_pending {
+                        None
+                    } else {
+                        view.waiting_texture()
+                    };
+                    if let Some(texture) = waiting {
+                        super::wait_for(texture, handle);
+                    }
+                    let later =
+                        upload_pending || !for_draw && (view.is_buffer() || waiting.is_some());
+                    // Another view of the placed texture the slot shows already (a
+                    // title that streams a texture in writes its view again with
+                    // more mips each time some arrive): the slot goes on showing
+                    // the old view until a draw or the texture pass makes the new
+                    // one and uploads what it shows. Made null here, the texture
+                    // read as nothing for as long as it waited in the queue, every
+                    // time it got sharper.
+                    if later
+                        && keep_views()
+                        && view_at(
+                            made[index as usize] as u32,
+                            (made[index as usize] >> 32) as u32,
+                        )
+                        .is_some_and(|old| same_placed_texture(&old, &view))
+                    {
+                        KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return true;
+                    }
+                    made[index as usize] = if later { 0 } else { key };
+                    let kept = if later {
+                        None
+                    } else {
+                        make(&view, self.cpu(index))
+                    };
+                    if kept.is_none() && !self.sampler {
+                        null_for(&view, self.cpu(index));
+                    }
+                    self.keep(index, kept.flatten());
                 }
-            }
-            // A view of a texture object that has no host copy yet waits
-            // for it, as buffer views wait for a draw: the slot is made
-            // when the texture is first used (`super::make_waiting`), or
-            // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
-            }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
-            // Another view of the placed texture the slot shows already (a
-            // title that streams a texture in writes its view again with
-            // more mips each time some arrive): the slot goes on showing
-            // the old view until a draw or the texture pass makes the new
-            // one and uploads what it shows. Made null here, the texture
-            // read as nothing for as long as it waited in the queue, every
-            // time it got sharper.
-            if later
-                && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
-            {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            };
+            let published = if let Some(resource) = resource {
+                crate::resource::with_descriptor_gate(resource, |pending| {
+                    if pending && wait_for_ahead {
+                        None
+                    } else {
+                        Some(publish(pending))
+                    }
+                })
+            } else {
+                Some(publish(false))
+            };
+            if let Some(kept_old) = published {
+                if kept_old {
+                    return Some(view);
+                }
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+            match crate::texture::ahead::wait(resource.expect("pending view has a resource")) {
+                crate::texture::ahead::Wait::Ready
+                | crate::texture::ahead::Wait::Failed => {}
+                crate::texture::ahead::Wait::DeviceLost => {
+                    crate::host::fail(format_args!(
+                        "texture upload-ahead COPY queue failed before table descriptor publication"
+                    ));
+                }
             }
-            self.keep(index, kept.flatten());
         }
-        Some(view)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no

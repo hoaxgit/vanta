@@ -23,6 +23,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+pub(crate) mod ahead;
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -47,6 +49,8 @@ pub(crate) struct Staging {
     bytes: u64,
     memory: *const u8,
     last: Mutex<Last>,
+    /// Excludes CPU detiling while the COPY queue reads this upload buffer.
+    copy_lock: Mutex<()>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
     /// the upload only then. (Every list that sampled a title texture
@@ -68,8 +72,9 @@ struct Last {
     partial: Option<u64>,
 }
 
-// SAFETY: the staging mapping is written only at submission, under
-// `last`'s lock; the title memory is only read.
+// SAFETY: the staging mapping is written only under `copy_lock` and `last`;
+// title memory is only read. A COPY-queue job keeps `copy_lock` until its
+// fence completes.
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
@@ -503,6 +508,11 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    if ahead::broken() {
+        crate::host::fail(format_args!(
+            "texture upload-ahead COPY queue lost its fence before a direct-list upload"
+        ));
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -517,6 +527,19 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     use std::sync::atomic::Ordering::Relaxed;
+    while crate::resource::upload_ahead_pending(resource) {
+        match ahead::wait(resource) {
+            ahead::Wait::Ready | ahead::Wait::Failed => {}
+            ahead::Wait::DeviceLost => {
+                crate::host::fail(format_args!(
+                    "texture upload-ahead COPY queue failed before a direct-list use"
+                ));
+            }
+        }
+    }
+    if !crate::resource::claim_direct_upload(resource) {
+        return;
+    }
     staging.used.store(crate::host::moment(), Relaxed);
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
@@ -604,6 +627,23 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
+        let _copy = match self.copy_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        self.refresh_locked();
+    }
+
+    /// Refreshes and holds the staging bytes stable until the caller drops
+    /// the guard after its copy-queue fence completes.
+    pub(crate) fn refresh_for_ahead(&self) -> std::sync::MutexGuard<'_, ()> {
+        let copy = self.copy_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.refresh_locked();
+        copy
+    }
+
+    fn refresh_locked(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
@@ -803,6 +843,33 @@ impl Staging {
             }
         }
     }
+}
+
+/// Refreshes title-written textures together when a submission asks for
+/// several independent staging buffers. Each staging owns its mapped output
+/// and serializes its own refreshes; the worker batch joins before uploads
+/// or any later submission steps use those bytes.
+pub(crate) fn refresh_all(stagings: Vec<Arc<Staging>>) {
+    refresh_many(stagings, Staging::refresh);
+}
+
+const PARALLEL_REFRESH_MIN: usize = 4;
+
+fn refresh_many<T>(stagings: Vec<Arc<T>>, refresh: fn(&T))
+where
+    T: Send + Sync + 'static,
+{
+    if stagings.len() < PARALLEL_REFRESH_MIN {
+        for staging in stagings {
+            refresh(&staging);
+        }
+        return;
+    }
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = stagings
+        .into_iter()
+        .map(|staging| Box::new(move || refresh(&staging)) as Box<dyn FnOnce() + Send>)
+        .collect();
+    crate::shadow::wide_run(jobs);
 }
 
 /// Lets go of a title texture's staging buffer (lists that recorded an
@@ -1051,6 +1118,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         bytes: total,
         memory,
         last: Mutex::default(),
+        copy_lock: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
@@ -1174,5 +1242,44 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::refresh_many;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn count_refresh(count: &AtomicUsize) {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn small_texture_batches_refresh_before_return() {
+        let stagings: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+        refresh_many(stagings.clone(), count_refresh);
+
+        assert!(
+            stagings
+                .iter()
+                .all(|staging| staging.load(Ordering::Relaxed) == 1)
+        );
+    }
+
+    #[test]
+    fn parallel_texture_batches_refresh_before_return() {
+        let stagings: Vec<_> = (0..8).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+
+        refresh_many(stagings.clone(), count_refresh);
+
+        assert!(
+            stagings
+                .iter()
+                .all(|staging| staging.load(Ordering::Relaxed) == 1)
+        );
     }
 }
